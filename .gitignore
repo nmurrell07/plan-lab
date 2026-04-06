@@ -1,0 +1,7 @@
+node_modules/
+dist/
+workspaces/
+results/*.json
+results/*.ndjson
+*.log
+.DS_Store

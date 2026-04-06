@@ -1,0 +1,11 @@
+{
+  "id": "Q01",
+  "tier": "Easy",
+  "topic": "Debug question-01/index.js — the diffArray function returns wrong results. It should compute the symmetric difference of two arrays.\nRead the code, run \"node test/question-01.test.js\", fix the bug, run tests again. When tests pass, call finish.",
+  "files": {
+    "question-01/index.js": "function diffArray(arr1, arr2) {\n  return arr1.concat(arr2)\n    .filter(item => arr1.includes(item) || !arr2.includes(item));\n}\nmodule.exports = { diffArray };\n",
+    "test/question-01.test.js": "const assert = require(\"assert\");\nconst { diffArray } = require(\"../question-01/index.js\");\nlet passed = 0, failed = 0;\nfunction runTest(name, fn) { try { fn(); passed++; console.log(\"PASS: \" + name); } catch(e) { failed++; console.log(\"FAIL: \" + name + \" — \" + e.message); } }\nrunTest(\"basic sym diff\", () => { assert.deepStrictEqual(diffArray([1,2,3,5],[1,2,3,4,5]).sort(), [4]); });\nrunTest(\"string sym diff\", () => { assert.deepStrictEqual(diffArray([\"diorite\",\"andesite\",\"grass\"],[\"diorite\",\"andesite\",\"grass\",\"dirt\"]), [\"dirt\"]); });\nrunTest(\"empty vs non-empty\", () => { assert.deepStrictEqual(diffArray([],[\"snuffleupagus\"]), [\"snuffleupagus\"]); });\nrunTest(\"identical arrays\", () => { assert.deepStrictEqual(diffArray([1,2,3],[1,2,3]), []); });\nconsole.log(\"\\n\" + passed + \"/\" + (passed+failed) + \" tests passed\");\nif (failed > 0) process.exit(1);\n"
+  },
+  "buggyFiles": ["question-01/index.js"],
+  "testCmd": "node test/question-01.test.js"
+}

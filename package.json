@@ -1,0 +1,17 @@
+{
+  "name": "plan-lab",
+  "version": "0.1.0",
+  "description": "Isolated planning-mode experimentation harness for LM Studio models",
+  "type": "module",
+  "scripts": {
+    "build": "bun build src/bench.ts --outdir dist --target bun",
+    "bench": "bun run src/bench.ts",
+    "bench:quick": "SCENARIOS=q01-easy MAX_TURNS=10 bun run src/bench.ts",
+    "bench:plan-only": "PLAN_ONLY=1 bun run src/bench.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "@types/bun": "^1.1.0"
+  }
+}

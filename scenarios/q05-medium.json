@@ -1,0 +1,11 @@
+{
+  "id": "Q05",
+  "tier": "Medium",
+  "topic": "Debug question-05/index.js — an event tracker with TWO bugs. Fix both, run \"node test/question-05.test.js\". When tests pass, call finish.",
+  "files": {
+    "question-05/index.js": "function createEventTracker() {\n  const events = {};\n  return {\n    track(name) {\n      const now = Date.now();\n      if (!events[name]) events[name] = { count: 0, first: now, last: now };\n      events[name].count++;\n      // Bug 1: should update 'last' timestamp but doesn't\n    },\n    stats(name) {\n      const e = events[name];\n      if (!e) return null;\n      // Bug 2: returns 'first' for both first and last\n      return { count: e.count, first: e.first, last: e.first };\n    },\n    reset(name) { if (name) delete events[name]; else Object.keys(events).forEach(k => delete events[k]); },\n  };\n}\nmodule.exports = { createEventTracker };\n",
+    "test/question-05.test.js": "const assert = require(\"assert\");\nconst { createEventTracker } = require(\"../question-05/index.js\");\nlet passed = 0, failed = 0;\nfunction runTest(name, fn) { try { fn(); passed++; console.log(\"PASS: \" + name); } catch(e) { failed++; console.log(\"FAIL: \" + name + \" — \" + e.message); } }\nrunTest(\"track + stats\", () => { const t = createEventTracker(); t.track(\"click\"); const s = t.stats(\"click\"); assert.strictEqual(s.count, 1); });\nrunTest(\"last timestamp updates\", () => { const t = createEventTracker(); t.track(\"click\"); const first = t.stats(\"click\").first; const start = Date.now(); while(Date.now() - start < 5) {} t.track(\"click\"); const s = t.stats(\"click\"); assert.strictEqual(s.count, 2); assert.ok(s.last > first, \"last should be > first\"); });\nrunTest(\"unknown event\", () => { const t = createEventTracker(); assert.strictEqual(t.stats(\"x\"), null); });\nrunTest(\"reset single\", () => { const t = createEventTracker(); t.track(\"a\"); t.reset(\"a\"); assert.strictEqual(t.stats(\"a\"), null); });\nconsole.log(\"\\n\" + passed + \"/\" + (passed+failed) + \" tests passed\");\nif (failed > 0) process.exit(1);\n"
+  },
+  "buggyFiles": ["question-05/index.js"],
+  "testCmd": "node test/question-05.test.js"
+}
