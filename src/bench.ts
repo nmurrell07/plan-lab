@@ -236,7 +236,7 @@ async function runExperiment(
 
     let basePrompt = toolMode === "meta" ? META_SYSTEM_PROMPT : BASE_SYSTEM_PROMPT
     if (plan) {
-      basePrompt = injectPlanIntoPrompt(basePrompt, plan)
+      basePrompt = injectPlanIntoPrompt(basePrompt, plan, execWorkDir)
     }
 
     const baseExecutor = createToolExecutor()

@@ -182,12 +182,33 @@ export async function runAgent(config: RunConfig): Promise<RunResult> {
         consecutiveEmpty++
         console.log(`  ${label} T${turn + 1}: EMPTY (${consecutiveEmpty} consecutive)`)
 
-        if (consecutiveEmpty >= 3) {
-          result.error = "3 consecutive empty responses — agent stalled"
+        if (consecutiveEmpty >= 4) {
+          result.error = "4 consecutive empty responses — agent stalled"
           break
         }
 
-        messages.push({ role: "user", content: "You returned empty. Use your tools to make progress. Act now." })
+        // Context-aware nudge: tell the model exactly what to do next
+        const lastToolResult = result.toolCalls[result.toolCalls.length - 1]
+        let nudge: string
+
+        if (!lastToolResult) {
+          // Haven't done anything yet — start investigating
+          nudge = "Call investigate to read the buggy files. Start now."
+        } else if (!result.filesModified && result.toolCalls.filter(t => t.tool === "investigate" || t.realTool === "read").length > 0) {
+          // Has read files but hasn't edited — time to edit
+          nudge = "You've read the files. Now call modify to fix the bug. Use the exact text from the file."
+        } else if (result.filesModified && !result.testsPass) {
+          // Has edited but tests haven't passed — run tests
+          nudge = `Run the tests: execute(command="${testCmd || 'node test/*.test.js'}"). If they fail, read the error and fix it.`
+        } else {
+          nudge = "Use your tools to make progress. Act now — don't think, just call a tool."
+        }
+
+        // Don't count empty turns toward maxTurns for small models — they're not real turns
+        // Instead, just inject the nudge and retry without incrementing the turn counter
+        messages.push({ role: "user", content: nudge })
+        // Give back the turn — empty responses shouldn't count
+        turn--
         continue
       }
 

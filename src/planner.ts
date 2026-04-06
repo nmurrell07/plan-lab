@@ -120,7 +120,11 @@ function formatStructuredPlan(args: StructuredPlan): string {
   }
   if (files.length > 0) {
     lines.push("## Files to Modify")
-    for (const f of files) lines.push(`- \`${f.path}\` -- ${f.change}`)
+    for (const f of files) {
+      // No backticks — small models copy them literally into tool calls
+      const cleanPath = f.path.replace(/`/g, "").trim()
+      lines.push(`- ${cleanPath} -- ${f.change}`)
+    }
     lines.push("")
   }
 
@@ -540,17 +544,59 @@ export async function generatePlan(config: PlanningConfig): Promise<PlanArtifact
 
 // ── Plan injection into worker system prompt ──────────────────────────
 
-export function injectPlanIntoPrompt(basePrompt: string, artifact: PlanArtifact): string {
+export function injectPlanIntoPrompt(basePrompt: string, artifact: PlanArtifact, workDir?: string): string {
+  let planText = artifact.plan
+
+  // Validate and clean plan file paths against actual workspace
+  if (workDir) {
+    planText = validatePlanPaths(planText, workDir)
+  }
+
   return `${basePrompt}
 
-## Implementation Plan
-The following plan was produced during the planning phase. Follow it closely.
+## Implementation Plan (guidance — adapt as needed)
+A planning phase produced the following plan. Use it as a starting guide, but trust what you observe over what the plan says.
 
-${artifact.plan}
+${planText}
 
-## Rules for Plan Execution
-- Follow the plan steps in order
-- If the plan is wrong, adapt but note the deviation
-- Do not re-explore what the plan already covers
-- Call complete/finish when all plan steps are done and verification passes`
+## How to Use This Plan
+- The plan gives you a head start — use it to know WHERE to look and WHAT to fix
+- If a file path in the plan doesn't work, use investigate to find the correct path
+- If a step doesn't make sense after reading the code, skip it and do what's right
+- Always verify by running the test command before finishing
+- The plan is a suggestion, not a contract — what matters is passing the tests`
+}
+
+// ── Plan path validation ──────────────────────────────────────────────
+
+function validatePlanPaths(planText: string, workDir: string): string {
+  const fs = require("fs")
+  const path = require("path")
+
+  // Find file paths in the plan (lines starting with "- " followed by a path-like string)
+  return planText.replace(/^- (.+?\.\w+)(.*)/gm, (match, filePath, rest) => {
+    const cleanPath = filePath.replace(/`/g, "").trim()
+    const resolved = path.resolve(workDir, cleanPath)
+
+    if (fs.existsSync(resolved)) {
+      return `- ${cleanPath}${rest}`
+    }
+
+    // Try to find the file anywhere in the workspace
+    const basename = path.basename(cleanPath)
+    try {
+      const { execSync } = require("child_process")
+      const found = execSync(
+        `find ${JSON.stringify(workDir)} -name ${JSON.stringify(basename)} -not -path '*/node_modules/*' 2>/dev/null | head -1`,
+        { encoding: "utf-8" },
+      ).trim()
+
+      if (found) {
+        const relativePath = path.relative(workDir, found)
+        return `- ${relativePath}${rest} [corrected from: ${cleanPath}]`
+      }
+    } catch { /* skip */ }
+
+    return `- ${cleanPath}${rest} [WARNING: file not found — use investigate to locate]`
+  })
 }
