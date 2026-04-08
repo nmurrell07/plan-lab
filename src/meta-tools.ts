@@ -11,8 +11,9 @@
  * The model thinks in intents; the router translates to real tools.
  */
 
-import type { OpenAIToolDef, SendWithToolsFn } from "./client"
+import type { OpenAIToolDef, SendWithToolsFn, ChatMessage } from "./client"
 import type { ToolCall, ToolCallResult, ToolExecutor, ExecutionContext } from "./tools"
+import { runSurgicalEditConveyor } from "./conveyor"
 
 // ── Meta-tool FC definitions ──────────────────────────────────────────
 
@@ -188,6 +189,12 @@ export interface MetaToolConfig {
   baseExecutor: ToolExecutor
   testCmd?: string
   buggyFiles?: string[]
+  /** SendWithTools for surgical edit conveyor stations (optional — falls back to direct edit) */
+  sendWithTools?: SendWithToolsFn
+  /** Model ID for conveyor station calls */
+  model?: string
+  /** Enable surgical edit conveyor for modify calls (default: true if sendWithTools provided) */
+  surgicalConveyor?: boolean
 }
 
 export interface MetaExecutorState {
@@ -195,6 +202,9 @@ export interface MetaExecutorState {
   consecutiveTestFails: number
   lastEditFile: string | null
   commandHistory: Array<{ sig: string; success: boolean }>
+  surgicalEdits: number
+  surgicalSuccesses: number
+  directEditFallbacks: number
 }
 
 export function createMetaToolExecutor(config: MetaToolConfig): {
@@ -202,11 +212,16 @@ export function createMetaToolExecutor(config: MetaToolConfig): {
   tools: OpenAIToolDef[]
   state: MetaExecutorState
 } {
+  const useSurgical = (config.surgicalConveyor ?? true) && !!config.sendWithTools && !!config.model
+
   const state: MetaExecutorState = {
     notes: [],
     consecutiveTestFails: 0,
     lastEditFile: null,
     commandHistory: [],
+    surgicalEdits: 0,
+    surgicalSuccesses: 0,
+    directEditFallbacks: 0,
   }
 
   const executor: ToolExecutor = {
@@ -241,26 +256,111 @@ export function createMetaToolExecutor(config: MetaToolConfig): {
           continue
         }
 
-        // ── Translate meta-tool to real tool(s) ──
-        const translated = translateMetaCall(call)
+        // ── Surgical edit conveyor for modify calls ──
+        if (call.tool === "modify" && useSurgical) {
+          const file = call.args.file || call.args.path || ""
+          const oldText = call.args.old_text || call.args.old_string || ""
+          const searchHint = oldText.split("\n")[0]?.trim().slice(0, 60) || ""
 
-        for (const realCall of translated) {
-          const realResults = await config.baseExecutor.executeAll([realCall], context)
-          for (const r of realResults) {
-            results.push({ ...r, tool: call.tool })
-            state.commandHistory.push({ sig: callSig, success: r.success })
+          if (file && searchHint) {
+            state.surgicalEdits++
+            const surgicalMessages: ChatMessage[] = [
+              { role: "system", content: "You are editing code. Answer each station question precisely." },
+              { role: "user", content: `Edit ${file}: find "${searchHint}" and replace the matching section.` },
+            ]
 
-            // Track edit/test cycles for stuck detection
-            if (realCall.tool === "edit" && r.success) {
-              state.lastEditFile = call.args.file || call.args.path || null
-              state.consecutiveTestFails = 0
-            }
-            if (realCall.tool === "bash") {
-              const isTestPass = r.success && r.output?.includes("tests passed") && !r.output?.includes("FAIL")
-              if (isTestPass) {
+            try {
+              const surgicalResult = await runSurgicalEditConveyor(
+                surgicalMessages,
+                config.sendWithTools!,
+                config.model!,
+                context.workDir,
+                2,
+                {
+                  file,
+                  searchKeyword: searchHint,
+                  // Pass the model's original new_text — it was written with full context
+                  newText: call.args.new_text || call.args.new_string || call.args.content || undefined,
+                },
+              )
+
+              if (surgicalResult.success) {
+                state.surgicalSuccesses++
+                console.log(`    [surgical] SUCCESS: ${surgicalResult.output}`)
+                results.push({ ...surgicalResult, tool: call.tool })
+                state.commandHistory.push({ sig: callSig, success: true })
+                state.lastEditFile = file
                 state.consecutiveTestFails = 0
-              } else if (state.lastEditFile) {
-                state.consecutiveTestFails++
+                // Skip to auto-test (handled below)
+                goto_auto_test: {
+                  // Auto-test is handled after this block
+                }
+              } else {
+                console.log(`    [surgical] FAIL: ${surgicalResult.error} — falling back to direct edit`)
+                state.directEditFallbacks++
+                // Fall through to direct edit below
+              }
+            } catch (err: any) {
+              console.log(`    [surgical] ERROR: ${err.message?.slice(0, 60)} — falling back to direct edit`)
+              state.directEditFallbacks++
+              // Fall through to direct edit below
+            }
+
+            // If surgical succeeded, skip direct edit
+            if (results.length > 0 && results[results.length - 1].tool === call.tool && results[results.length - 1].success) {
+              // Already handled — skip to auto-test
+            } else {
+              // Fall through to direct edit
+              const translated = translateMetaCall(call)
+              for (const realCall of translated) {
+                const realResults = await config.baseExecutor.executeAll([realCall], context)
+                for (const r of realResults) {
+                  results.push({ ...r, tool: call.tool })
+                  state.commandHistory.push({ sig: callSig, success: r.success })
+                  if (realCall.tool === "edit" && r.success) {
+                    state.lastEditFile = file
+                    state.consecutiveTestFails = 0
+                  }
+                }
+              }
+            }
+          } else {
+            // No search hint — go direct
+            const translated = translateMetaCall(call)
+            for (const realCall of translated) {
+              const realResults = await config.baseExecutor.executeAll([realCall], context)
+              for (const r of realResults) {
+                results.push({ ...r, tool: call.tool })
+                state.commandHistory.push({ sig: callSig, success: r.success })
+                if (realCall.tool === "edit" && r.success) {
+                  state.lastEditFile = call.args.file || call.args.path || null
+                  state.consecutiveTestFails = 0
+                }
+              }
+            }
+          }
+        } else {
+          // ── Standard path: translate meta-tool to real tool(s) ──
+          const translated = translateMetaCall(call)
+
+          for (const realCall of translated) {
+            const realResults = await config.baseExecutor.executeAll([realCall], context)
+            for (const r of realResults) {
+              results.push({ ...r, tool: call.tool })
+              state.commandHistory.push({ sig: callSig, success: r.success })
+
+              // Track edit/test cycles for stuck detection
+              if (realCall.tool === "edit" && r.success) {
+                state.lastEditFile = call.args.file || call.args.path || null
+                state.consecutiveTestFails = 0
+              }
+              if (realCall.tool === "bash") {
+                const isTestPass = r.success && r.output?.includes("tests passed") && !r.output?.includes("FAIL")
+                if (isTestPass) {
+                  state.consecutiveTestFails = 0
+                } else if (state.lastEditFile) {
+                  state.consecutiveTestFails++
+                }
               }
             }
           }

@@ -247,6 +247,9 @@ async function runExperiment(
         baseExecutor,
         testCmd: scenario.testCmd,
         buggyFiles: scenario.buggyFiles,
+        sendWithTools: send,
+        model: modelEntry.model,
+        surgicalConveyor: true,
       })
       executor = meta.executor
       tools = meta.tools

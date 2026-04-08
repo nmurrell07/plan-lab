@@ -82,6 +82,8 @@ async function askStationValue(
 export interface SurgicalEditSeed {
   file?: string
   searchKeyword?: string
+  /** Model's original replacement text — if provided, skip Station 4 (re-derivation) and use this directly */
+  newText?: string
 }
 
 export async function runSurgicalEditConveyor(
@@ -239,20 +241,30 @@ export async function runSurgicalEditConveyor(
   const oldText = oldLines.map((l, i) => `${String(startLine + i).padStart(4)} | ${l}`).join("\n")
 
   // ── Station 4: Write replacement ──
-  const replacement = await askStationValue(
-    messages,
-    [
-      `Replace lines ${startLine}-${endLine} in ${file}:`,
-      "",
-      oldText,
-      "",
-      "Write the replacement code. Only the code — no markdown fences, no explanation.",
-    ].join("\n"),
-    "replacement_code",
-    sendWithTools,
-    model,
-    maxRetries,
-  )
+  // If the model already provided new_text in the original call, USE IT.
+  // The model wrote new_text in the main conversation where it has full context
+  // (test output, plan, error messages). Re-deriving in a stripped station loses that.
+  let replacement: string | null = null
+
+  if (seed?.newText?.trim()) {
+    replacement = seed.newText
+    console.log(`    [surgical] Station 4: using model's original new_text (${replacement.length} chars)`)
+  } else {
+    replacement = await askStationValue(
+      messages,
+      [
+        `Replace lines ${startLine}-${endLine} in ${file}:`,
+        "",
+        oldText,
+        "",
+        "Write the replacement code. Only the code — no markdown fences, no explanation.",
+      ].join("\n"),
+      "replacement_code",
+      sendWithTools,
+      model,
+      maxRetries,
+    )
+  }
 
   if (!replacement) {
     return { tool: "edit", success: false, output: "", error: "Conveyor: no replacement provided" }
