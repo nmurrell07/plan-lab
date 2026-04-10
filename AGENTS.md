@@ -60,6 +60,23 @@ The diagram uses FigJam sections and sticky notes:
 - Record results in `results/` — never delete previous results
 - Note regressions immediately
 
+### Prompt Perspective
+- All prompts, plans, nudges, and system messages must use **first-person omniscient** voice
+- The agent is the protagonist — it owns the task as its own goal, not as an external request
+- Write: "I need to fix the off-by-one error" — not "The user wants you to fix the off-by-one error"
+- This applies at every layer: plan injection, stall nudges, exploration prompts, scenario framing, and **Evo guidance**
+- Evo is the architect, not a middleman — "I need to produce a plan that solves..." not "The user wants a plan for..."
+- Explorers own their investigation — "I'm looking for the entry point" not "The user asked me to find..."
+- **Evo nudges are inner monologue, not commands** — Evo injects thoughts as if the worker is thinking them itself
+- Write: "I've been reading the same file twice — I should try grep instead" not "Stop repeating and try a different approach"
+- The worker should never feel directed by an external authority; it should feel like it had the realization on its own
+
+### No Knowledge Seeding
+- Never embed solution hints, bug locations, or fix strategies into plans, prompts, nudges, or system messages
+- Planning improvements must come from better **process** (exploration, structuring, framing) — not from smuggling the answer to the model
+- If a change only helps because it tells the model what to do, it's not a planning improvement — it's a cheat
+- This applies to scenario design too: scenarios must be solvable from code inspection, not from hints baked into the harness
+
 ### Code Change Rules
 - All inference runs must go through the agent runner (`runAgent` in runner.ts)
 - Never bypass the meta-tool router for direct tool execution in experiments

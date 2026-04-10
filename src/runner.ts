@@ -54,6 +54,10 @@ export interface RunConfig {
   compaction?: boolean
   /** Run ID for ledger entries */
   runId?: string
+  /** Print full transcript (system prompt, assistant text, tool calls, results) */
+  verbose?: boolean
+  /** Callback to get current conveyor phase for context-aware nudges */
+  phaseHint?: () => string | undefined
 }
 
 export interface RunResult {
@@ -61,6 +65,7 @@ export interface RunResult {
   turns: number
   turnsWithToolCalls: number
   toolCalls: Array<{ tool: string; success: boolean; realTool?: string }>
+  touchedFiles: string[]
   totalTokens: number
   durationSec: number
   testsPass: boolean
@@ -90,6 +95,8 @@ interface TrajectoryEntry {
   phase?: string
 }
 
+const PERSPECTIVE = process.env.PERSPECTIVE || "1p"
+
 // ── Runner ─────────────────────────────────────────────────────────────
 
 export async function runAgent(config: RunConfig): Promise<RunResult> {
@@ -110,6 +117,7 @@ export async function runAgent(config: RunConfig): Promise<RunResult> {
     failureLedger,
     compaction: compactionEnabled = true,
     runId = `run-${Date.now()}`,
+    verbose = false,
   } = config
 
   const label = `[${logLabel}]`
@@ -118,6 +126,15 @@ export async function runAgent(config: RunConfig): Promise<RunResult> {
   const trajectory: TrajectoryEntry[] = []
 
   const context: ExecutionContext = { workDir, allowedTools }
+
+  if (verbose) {
+    console.log(`\n${"─".repeat(80)}`)
+    console.log(`TRANSCRIPT: ${agentName}`)
+    console.log(`${"─".repeat(80)}`)
+    console.log(`\n[SYSTEM PROMPT]\n${systemPrompt}\n`)
+    console.log(`[USER MESSAGE]\n${userMessage}\n`)
+    console.log(`${"─".repeat(80)}`)
+  }
 
   const messages: ChatMessage[] = [
     { role: "system", content: systemPrompt },
@@ -129,6 +146,7 @@ export async function runAgent(config: RunConfig): Promise<RunResult> {
     turns: 0,
     turnsWithToolCalls: 0,
     toolCalls: [],
+    touchedFiles: [],
     totalTokens: 0,
     durationSec: 0,
     testsPass: false,
@@ -174,6 +192,21 @@ export async function runAgent(config: RunConfig): Promise<RunResult> {
 
     result.totalTokens += turnResult.tokens?.total ?? 0
 
+    // ── Verbose: print assistant response ──
+    if (verbose) {
+      console.log(`\n[TURN ${turn + 1}] Assistant:`)
+      if (turnResult.content) console.log(`  Text: ${turnResult.content.slice(0, 500)}`)
+      if (turnResult.toolCalls?.length) {
+        for (const tc of turnResult.toolCalls) {
+          const args = tc.function.arguments
+          console.log(`  Tool: ${tc.function.name}(${args.length > 200 ? args.slice(0, 200) + '...' : args})`)
+        }
+      }
+      if (!turnResult.content?.trim() && !turnResult.toolCalls?.length) {
+        console.log(`  (empty response)`)
+      }
+    }
+
     // ── No tool calls — handle text-only or empty ──
     if (!turnResult.toolCalls || turnResult.toolCalls.length === 0) {
       const text = turnResult.content ?? ""
@@ -191,21 +224,47 @@ export async function runAgent(config: RunConfig): Promise<RunResult> {
         const lastToolResult = result.toolCalls[result.toolCalls.length - 1]
         let nudge: string
 
-        if (!lastToolResult) {
-          // Haven't done anything yet — start investigating
-          nudge = "Call investigate to read the buggy files. Start now."
-        } else if (!result.filesModified && result.toolCalls.filter(t => t.tool === "investigate" || t.realTool === "read").length > 0) {
-          // Has read files but hasn't edited — time to edit
-          nudge = "You've read the files. Now call modify to fix the bug. Use the exact text from the file."
-        } else if (result.filesModified && !result.testsPass) {
-          // Has edited but tests haven't passed — run tests
-          nudge = `Run the tests: execute(command="${testCmd || 'node test/*.test.js'}"). If they fail, read the error and fix it.`
+        // Phase-aware nudges for conveyor planner
+        const currentPhase = config.phaseHint?.()
+        if (currentPhase) {
+          if (currentPhase === "explore") {
+            nudge = "I should investigate the code to understand the problem. I'll call investigate now."
+          } else if (currentPhase === "execute") {
+            if (!result.filesModified) {
+              nudge = "I've registered my intent. Now I should call modify on the registered files."
+            } else {
+              nudge = `I should run the tests to verify: execute(command="${testCmd || 'node test/*.test.js'}").`
+            }
+          } else if (currentPhase === "verify") {
+            nudge = `I should run the tests: execute(command="${testCmd || 'node test/*.test.js'}").`
+          } else {
+            nudge = "I need to make progress. I should call a tool now."
+          }
+        } else if (PERSPECTIVE === "2p") {
+          if (!lastToolResult) {
+            nudge = "Call investigate to read the buggy files. Start now."
+          } else if (!result.filesModified && result.toolCalls.filter(t => t.tool === "investigate" || t.realTool === "read").length > 0) {
+            nudge = "You've read the files. Now call modify to fix the bug. Use the exact text from the file."
+          } else if (result.filesModified && !result.testsPass) {
+            nudge = `Run the tests: execute(command="${testCmd || 'node test/*.test.js'}"). If they fail, read the error and fix it.`
+          } else {
+            nudge = "Use your tools to make progress. Act now — don't think, just call a tool."
+          }
         } else {
-          nudge = "Use your tools to make progress. Act now — don't think, just call a tool."
+          if (!lastToolResult) {
+            nudge = "I should call investigate to read the buggy files. Time to start."
+          } else if (!result.filesModified && result.toolCalls.filter(t => t.tool === "investigate" || t.realTool === "read").length > 0) {
+            nudge = "I've read the files. Now I should call modify to fix the bug. I'll use the exact text from the file."
+          } else if (result.filesModified && !result.testsPass) {
+            nudge = `I should run the tests now: execute(command="${testCmd || 'node test/*.test.js'}"). If they fail, I'll read the error and fix it.`
+          } else {
+            nudge = "I need to make progress. I should call a tool now instead of thinking."
+          }
         }
 
         // Don't count empty turns toward maxTurns for small models — they're not real turns
         // Instead, just inject the nudge and retry without incrementing the turn counter
+        if (verbose) console.log(`  [NUDGE] ${nudge}`)
         messages.push({ role: "user", content: nudge })
         // Give back the turn — empty responses shouldn't count
         turn--
@@ -228,14 +287,17 @@ export async function runAgent(config: RunConfig): Promise<RunResult> {
         for (let i = 0; i < toolResults.length; i++) {
           const r = toolResults[i]
           result.toolCalls.push({ tool: recovered[i]?.tool || "?", realTool: r.tool, success: r.success })
+          const recLimit = (r.tool === "read" || r.tool === "investigate") ? 6000 : 4000
           messages.push({
             role: "user",
-            content: r.success ? `[Result] ${r.output?.slice(0, 2000)}` : `[Error] ${r.output} ${r.error || ""}`,
+            content: r.success ? `[Result] ${r.output?.slice(0, recLimit)}` : `[Error] ${r.output} ${r.error || ""}`,
           })
           trajectory.push({
             turn, translatedTool: r.tool, argsDigest: JSON.stringify(recovered[i]?.args || {}).slice(0, 120),
             success: r.success, metaTool: recovered[i]?.tool,
           })
+          const touched = extractTouchedPath(recovered[i], r)
+          if (touched && !result.touchedFiles.includes(touched)) result.touchedFiles.push(touched)
           if (checkTestPass(r)) result.testsPass = true
           if (r.tool === "edit" || r.tool === "write") result.filesModified = true
         }
@@ -255,9 +317,13 @@ export async function runAgent(config: RunConfig): Promise<RunResult> {
       }
 
       messages.push({ role: "assistant", content: text })
-      const nudge = notes.length > 0
-        ? `Use your tools. Your notes so far:\n${notes.map((n, i) => `${i + 1}. ${n}`).join("\n")}\n\nAct, don't explain.`
-        : "Use your tools (investigate, modify, execute, finish). Act, don't explain."
+      const nudge = PERSPECTIVE === "2p"
+        ? (notes.length > 0
+          ? `Use your tools. Your notes so far:\n${notes.map((n, i) => `${i + 1}. ${n}`).join("\n")}\n\nAct, don't explain.`
+          : "Use your tools (investigate, modify, execute, finish). Act, don't explain.")
+        : (notes.length > 0
+          ? `I should use my tools. My notes so far:\n${notes.map((n, i) => `${i + 1}. ${n}`).join("\n")}\n\nI need to act, not explain.`
+          : "I should use my tools (investigate, modify, execute, finish). I need to act, not explain.")
       messages.push({ role: "user", content: nudge })
       continue
     }
@@ -289,7 +355,9 @@ export async function runAgent(config: RunConfig): Promise<RunResult> {
           })
           messages.push({
             role: "tool",
-            content: `You are repeating the same command (${loop.count} times). Try a DIFFERENT approach.`,
+            content: PERSPECTIVE === "2p"
+              ? `You are repeating the same command (${loop.count} times). Try a DIFFERENT approach.`
+              : `I've repeated this same command ${loop.count} times now. I should try a different approach.`,
             tool_call_id: turnResult.toolCalls[0].id,
           })
           continue
@@ -353,6 +421,17 @@ export async function runAgent(config: RunConfig): Promise<RunResult> {
     const summary = toolResults.map(r => `${r.tool}:${r.success ? "ok" : "ERR"}`).join(", ")
     console.log(`  ${label} T${turn + 1}: ${parsedCalls.map(c => c.tool).join(",")} -> ${summary}`)
 
+    // ── Verbose: print tool results ──
+    if (verbose) {
+      for (let i = 0; i < toolResults.length; i++) {
+        const r = toolResults[i]
+        if (r) {
+          const output = r.output?.slice(0, 300) || "(no output)"
+          console.log(`  [RESULT ${parsedCalls[i]?.tool} → ${r.tool}] ${r.success ? "OK" : "ERR"}: ${output}${r.error ? ` | error: ${r.error}` : ""}`)
+        }
+      }
+    }
+
     // Record results and update trajectory
     for (let i = 0; i < parsedCalls.length; i++) {
       const r = toolResults[i]
@@ -368,6 +447,8 @@ export async function runAgent(config: RunConfig): Promise<RunResult> {
           success: r.success,
           metaTool: parsedCalls[i].tool,
         })
+        const touched = extractTouchedPath(parsedCalls[i], r)
+        if (touched && !result.touchedFiles.includes(touched)) result.touchedFiles.push(touched)
 
         // Record failures in ledger
         if (!r.success && failureLedger) {
@@ -404,8 +485,10 @@ export async function runAgent(config: RunConfig): Promise<RunResult> {
     for (let i = 0; i < turnResult.toolCalls.length; i++) {
       const tc = turnResult.toolCalls[i]
       const r = toolResults[i]
+      // Use larger limit for read operations (files need to be fully visible)
+      const outputLimit = (r?.tool === "read" || r?.tool === "investigate") ? 6000 : 4000
       const content = r
-        ? (r.success ? `OK: ${r.output?.slice(0, 2000)}` : `ERROR: ${r.output}${r.error ? ` (${r.error})` : ""}`)
+        ? (r.success ? `OK: ${r.output?.slice(0, outputLimit)}` : `ERROR: ${r.output}${r.error ? ` (${r.error})` : ""}`)
         : "ERROR: No result"
       messages.push({ role: "tool", content, tool_call_id: tc.id })
     }
@@ -431,4 +514,28 @@ function checkTestPass(r: ToolCallResult): boolean {
   if (r.output.includes("Tests pass")) return true
   if (r.output.includes("Complete approved")) return true
   return false
+}
+
+function extractTouchedPath(call: ToolCall | undefined, result: ToolCallResult): string | null {
+  if (!call) return null
+
+  const normalize = (value: string | undefined): string | null => {
+    if (!value) return null
+    const trimmed = value.replace(/`/g, "").trim().replace(/^\.\//, "")
+    return trimmed || null
+  }
+
+  if (result.tool === "read" || result.tool === "write" || result.tool === "edit") {
+    return normalize(call.args.path || call.args.file || call.args.target)
+  }
+
+  if (call.tool === "investigate" && (call.args.how || "read") === "read") {
+    return normalize(call.args.target)
+  }
+
+  if (call.tool === "modify") {
+    return normalize(call.args.file || call.args.path)
+  }
+
+  return null
 }

@@ -8,6 +8,7 @@
 import fs from "fs/promises"
 import { existsSync, readFileSync } from "fs"
 import path from "path"
+import { validateSyntax } from "./conveyor"
 import { spawn } from "child_process"
 import type { OpenAIToolDef } from "./client"
 
@@ -113,6 +114,15 @@ async function toolWrite(args: Record<string, string>, ctx: ExecutionContext): P
   if (!resolved) return { tool: "write", success: false, output: "", error: `Path outside workspace: ${filePath}` }
 
   try {
+    const validation = validateSyntax(content, filePath)
+    if (!validation.valid) {
+      return {
+        tool: "write",
+        success: false,
+        output: `Write blocked — content has a syntax error: ${validation.error}`,
+        error: `Syntax validation failed [${validation.bucket}]`,
+      }
+    }
     await fs.mkdir(path.dirname(resolved), { recursive: true })
     await fs.writeFile(resolved, content, "utf-8")
     return { tool: "write", success: true, output: `Written ${content.length} chars to ${filePath}` }
@@ -144,6 +154,8 @@ async function toolEdit(args: Record<string, string>, ctx: ExecutionContext): Pr
 
       lines.splice(start, end - start, ...newLines)
       content = lines.join("\n")
+      const v1 = validateSyntax(content, filePath)
+      if (!v1.valid) return { tool: "edit", success: false, output: `Edit would create syntax error in ${filePath}: ${v1.error}`, error: `Syntax validation failed [${v1.bucket}]` }
       await fs.writeFile(resolved, content, "utf-8")
       return { tool: "edit", success: true, output: `Replaced lines ${start + 1}-${end} in ${filePath}` }
     }
@@ -158,12 +170,16 @@ async function toolEdit(args: Record<string, string>, ctx: ExecutionContext): Pr
         const trimmed = oldStr.trim()
         if (trimmed && content.includes(trimmed)) {
           content = content.replace(trimmed, newStr.trim())
+          const v2 = validateSyntax(content, filePath)
+          if (!v2.valid) return { tool: "edit", success: false, output: `Edit would create syntax error in ${filePath}: ${v2.error}`, error: `Syntax validation failed [${v2.bucket}]` }
           await fs.writeFile(resolved, content, "utf-8")
           return { tool: "edit", success: true, output: `Replaced (trimmed match) in ${filePath}` }
         }
         return { tool: "edit", success: false, output: `old_string not found in ${filePath}`, error: "No match" }
       }
       content = content.replace(oldStr, newStr)
+      const v3 = validateSyntax(content, filePath)
+      if (!v3.valid) return { tool: "edit", success: false, output: `Edit would create syntax error in ${filePath}: ${v3.error}`, error: `Syntax validation failed [${v3.bucket}]` }
       await fs.writeFile(resolved, content, "utf-8")
       return { tool: "edit", success: true, output: `Replaced in ${filePath}` }
     }
@@ -177,6 +193,8 @@ async function toolEdit(args: Record<string, string>, ctx: ExecutionContext): Pr
         return { tool: "edit", success: false, output: `Search text not found in ${filePath}`, error: "No match" }
       }
       content = content.replace(search, replace)
+      const v4 = validateSyntax(content, filePath)
+      if (!v4.valid) return { tool: "edit", success: false, output: `Edit would create syntax error in ${filePath}: ${v4.error}`, error: `Syntax validation failed [${v4.bucket}]` }
       await fs.writeFile(resolved, content, "utf-8")
       return { tool: "edit", success: true, output: `Search/replace in ${filePath}` }
     }

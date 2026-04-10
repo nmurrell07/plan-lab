@@ -59,6 +59,7 @@ const MAX_TURNS = parseInt(process.env.MAX_TURNS ?? "15", 10)
 const TIMEOUT_MS = parseInt(process.env.TIMEOUT_MS ?? "300000", 10)
 const RESULTS_DIR = process.env.RESULTS_DIR || "./results"
 const PLAN_ONLY = process.env.PLAN_ONLY === "1"
+const VERBOSE = process.env.VERBOSE === "1"
 
 type ToolMode = "base" | "meta"
 
@@ -108,18 +109,34 @@ async function createWorkspace(scenario: Scenario): Promise<string> {
 
 // ── System prompts ────────────────────────────────────────────────────
 
-const BASE_SYSTEM_PROMPT = `You are a Senior Developer debugging code.
+const BASE_SYSTEM_PROMPT = `I am a Senior Developer debugging code.
 
-You have standard development tools: read files, edit code, run commands, search code, list directories.
+I have standard development tools: read files, edit code, run commands, search code, list directories.
 
-Workflow:
-1. Read the buggy files to understand the code
-2. Run the test command to see failures
-3. Fix the bugs by editing the code
-4. Run tests again to verify
-5. When tests pass, call complete with a summary`
+My workflow:
+1. I read the buggy files to understand the code
+2. I run the test command to see failures
+3. I fix the bugs by editing the code
+4. I run tests again to verify
+5. When tests pass, I call complete with a summary`
 
-const META_SYSTEM_PROMPT = `You are a Senior Developer debugging code.
+const META_SYSTEM_PROMPT_1P = `I am a Senior Developer debugging code.
+
+I have exactly 5 tools:
+- investigate(target, how) -- read files, search code, list dirs
+- modify(file, old_text, new_text) -- edit code (find and replace)
+- execute(command) -- run tests and commands
+- note(text) -- save a finding to my scratchpad
+- finish(summary) -- signal completion (tests must pass first)
+
+My workflow:
+1. I investigate the buggy files (read them)
+2. I execute the test command to see failures
+3. I modify the code to fix bugs
+4. I execute tests again
+5. When tests pass, I call finish`
+
+const META_SYSTEM_PROMPT_2P = `You are a Senior Developer debugging code.
 
 You have exactly 5 tools:
 - investigate(target, how) -- read files, search code, list dirs
@@ -135,6 +152,36 @@ Workflow:
 4. execute tests again
 5. When tests pass, call finish`
 
+const CONVEYOR_SYSTEM_PROMPT_1P = `I am a Senior Developer debugging code.
+
+I have these tools:
+- investigate(target, how) -- read files, search code, list dirs
+- register(intent, file, reason) -- declare what I will modify and why
+- modify(file, old_text, new_text) -- edit code (registered files only)
+- execute(command) -- run tests and commands
+- note(text) -- save a finding to my scratchpad
+- finish(summary) -- signal completion (tests must pass first)
+
+I work in phases: explore → register → execute → verify.
+I cannot skip phases. I must register my intent before modifying.`
+
+const CONVEYOR_SYSTEM_PROMPT_2P = `You are a Senior Developer debugging code.
+
+You have these tools:
+- investigate(target, how) -- read files, search code, list dirs
+- register(intent, file, reason) -- declare what you will modify and why
+- modify(file, old_text, new_text) -- edit code (registered files only)
+- execute(command) -- run tests and commands
+- note(text) -- save a finding to your scratchpad
+- finish(summary) -- signal completion (tests must pass first)
+
+You work in phases: explore → register → execute → verify.
+You cannot skip phases. You must register your intent before modifying.`
+
+const PERSPECTIVE = process.env.PERSPECTIVE || "1p"
+const META_SYSTEM_PROMPT = PERSPECTIVE === "2p" ? META_SYSTEM_PROMPT_2P : META_SYSTEM_PROMPT_1P
+const CONVEYOR_SYSTEM_PROMPT = PERSPECTIVE === "2p" ? CONVEYOR_SYSTEM_PROMPT_2P : CONVEYOR_SYSTEM_PROMPT_1P
+
 // ── Single run ────────────────────────────────────────────────────────
 
 interface ExperimentResult {
@@ -144,6 +191,7 @@ interface ExperimentResult {
   model: string
   planMode: PlanningMode
   toolMode: ToolMode
+  planStyle?: "guidance" | "checklist" | "conveyor"
   testsPass: boolean
   filesModified: boolean
   turns: number
@@ -153,6 +201,24 @@ interface ExperimentResult {
   planTokens: number
   planDurationMs: number
   planContent?: string
+  plannedFiles?: string[]
+  checklistSteps?: string[]
+  verificationCmd?: string
+  touchedFiles?: string[]
+  plannedFileTouches?: number
+  plannedFileCoverage?: number
+  checklistProgressPercent?: number
+  checklistCompletedSteps?: number
+  checklistBlockedSteps?: number
+  checklistTotalSteps?: number
+  checkoffCalls?: number
+  modifyGateBlocks?: number
+  finishGateBlocks?: number
+  conveyorFinalPhase?: string
+  conveyorRegistrations?: number
+  conveyorGateBlocks?: number
+  conveyorVerifyAttempts?: number
+  conveyorLoopBacks?: number
   error?: string
   interceptorFirings: number
   loopsDetected: number
@@ -213,6 +279,10 @@ async function runExperiment(
         result.planTokens = plan.tokenCost
         result.planDurationMs = plan.durationMs
         result.planContent = plan.plan
+        result.planStyle = plan.style
+        result.plannedFiles = plan.plannedFiles
+        result.checklistSteps = plan.checklistSteps
+        result.verificationCmd = plan.verification
         result.totalTokens += plan.tokenCost
       }
     }
@@ -234,7 +304,24 @@ async function runExperiment(
       timeoutMs: TIMEOUT_MS,
     })
 
-    let basePrompt = toolMode === "meta" ? META_SYSTEM_PROMPT : BASE_SYSTEM_PROMPT
+    let basePrompt = plan?.conveyorPhase ? CONVEYOR_SYSTEM_PROMPT
+      : toolMode === "meta" ? META_SYSTEM_PROMPT : BASE_SYSTEM_PROMPT
+    if (toolMode === "meta" && plan?.trackProgress) {
+      basePrompt += `
+
+You also have a checklist progress tool:
+- checkoff(step, status, note) -- mark a checklist step as in_progress, done, or blocked
+
+Use checkoff to keep your work aligned with the checklist.`
+      if (plan.requireInProgressStepForModify) {
+        basePrompt += `
+- You must mark a checklist step in progress before modifying code.`
+      }
+      if (plan.requireCompletedStepForFinish) {
+        basePrompt += `
+- You must mark at least one checklist step done before finishing.`
+      }
+    }
     if (plan) {
       basePrompt = injectPlanIntoPrompt(basePrompt, plan, execWorkDir)
     }
@@ -247,12 +334,89 @@ async function runExperiment(
         baseExecutor,
         testCmd: scenario.testCmd,
         buggyFiles: scenario.buggyFiles,
+        checklistSteps: plan?.checklistSteps,
+        enableCheckoff: !!plan?.trackProgress,
+        requireCompletedStepForFinish: !!plan?.requireCompletedStepForFinish,
+        requireInProgressStepForModify: !!plan?.requireInProgressStepForModify,
         sendWithTools: send,
         model: modelEntry.model,
         surgicalConveyor: true,
+        conveyorPhase: !!plan?.conveyorPhase,
       })
       executor = meta.executor
       tools = meta.tools
+      result.checklistTotalSteps = meta.state.checklistSteps.length || undefined
+      result.checkoffCalls = 0
+      result.checklistCompletedSteps = 0
+      result.checklistBlockedSteps = 0
+      result.checklistProgressPercent = 0
+      result.modifyGateBlocks = 0
+      result.finishGateBlocks = 0
+
+      const runResult = await runAgent({
+        agentName: "Dev",
+        systemPrompt: basePrompt,
+        userMessage: scenario.topic,
+        model: modelEntry.model,
+        endpoint: modelEntry.endpoint,
+        sendWithTools: send,
+        executor,
+        tools,
+        workDir: execWorkDir,
+        maxTurns: MAX_TURNS,
+        testCmd: scenario.testCmd,
+        allowedTools: ["read", "write", "edit", "grep", "list", "glob", "bash", "complete"],
+        logLabel: `${modelEntry.label}/${scenario.id}/${planMode}/${toolMode}`,
+        notes: meta.state.notes,
+        interceptors: true,
+        failureLedger: ledger,
+        compaction: true,
+        runId: `${scenario.id}-${modelEntry.label}-${planMode}-${toolMode}`,
+        verbose: VERBOSE,
+        phaseHint: meta.state.conveyor ? () => meta.state.conveyor?.phase : undefined,
+      })
+
+      result.testsPass = runResult.testsPass
+      result.filesModified = runResult.filesModified
+      result.turns = runResult.turns
+      result.turnsWithToolCalls = runResult.turnsWithToolCalls
+      result.touchedFiles = runResult.touchedFiles
+      result.totalTokens += runResult.totalTokens
+      result.error = runResult.error
+      result.interceptorFirings = runResult.interceptorFirings
+      result.loopsDetected = runResult.loopsDetected
+      result.dandelionsDetected = runResult.dandelionsDetected
+      result.compactions = runResult.compactions
+      result.recoveries = runResult.recoveries
+      result.checklistTotalSteps = meta.state.checklistSteps.length || undefined
+      result.checkoffCalls = meta.state.checkoffCalls || undefined
+      result.checklistCompletedSteps = meta.state.completedSteps || undefined
+      result.checklistBlockedSteps = meta.state.blockedSteps || undefined
+      result.checklistProgressPercent = meta.state.progressPercent || undefined
+      result.modifyGateBlocks = meta.state.modifyGateBlocks || undefined
+      result.finishGateBlocks = meta.state.finishGateBlocks || undefined
+
+      if (meta.state.conveyor) {
+        const cv = meta.state.conveyor
+        result.conveyorFinalPhase = cv.phase
+        result.conveyorRegistrations = cv.registrations.length || undefined
+        result.conveyorGateBlocks = cv.gateBlocks || undefined
+        result.conveyorVerifyAttempts = cv.verifyAttempts || undefined
+        result.conveyorLoopBacks = cv.loopBacks || undefined
+      }
+
+      if (plan?.plannedFiles?.length) {
+        const matches = countPlannedFileMatches(plan.plannedFiles, runResult.touchedFiles)
+        result.plannedFileTouches = matches
+        result.plannedFileCoverage = Math.round((matches / plan.plannedFiles.length) * 100)
+      }
+
+      if (ledger.meta.totalEntries > 0) {
+        console.log(`  ${printLedgerScorecard(ledger)}`)
+      }
+
+      await fs.rm(execWorkDir, { recursive: true, force: true }).catch(() => {})
+      return result
     } else {
       executor = baseExecutor
       tools = getBaseToolSchemas()
@@ -276,12 +440,14 @@ async function runExperiment(
       failureLedger: ledger,
       compaction: true,
       runId: `${scenario.id}-${modelEntry.label}-${planMode}-${toolMode}`,
+      verbose: VERBOSE,
     })
 
     result.testsPass = runResult.testsPass
     result.filesModified = runResult.filesModified
     result.turns = runResult.turns
     result.turnsWithToolCalls = runResult.turnsWithToolCalls
+    result.touchedFiles = runResult.touchedFiles
     result.totalTokens += runResult.totalTokens
     result.error = runResult.error
     result.interceptorFirings = runResult.interceptorFirings
@@ -289,6 +455,12 @@ async function runExperiment(
     result.dandelionsDetected = runResult.dandelionsDetected
     result.compactions = runResult.compactions
     result.recoveries = runResult.recoveries
+
+    if (plan?.plannedFiles?.length) {
+      const matches = countPlannedFileMatches(plan.plannedFiles, runResult.touchedFiles)
+      result.plannedFileTouches = matches
+      result.plannedFileCoverage = Math.round((matches / plan.plannedFiles.length) * 100)
+    }
 
     // Print ledger scorecard if there were failures
     if (ledger.meta.totalEntries > 0) {
@@ -353,6 +525,76 @@ function printReport(results: ExperimentResult[], scenarios: Scenario[]) {
     }
   }
 
+  const plannedResults = results.filter(r => r.planMode !== "none" && (r.plannedFileTouches !== undefined || r.planStyle === "checklist"))
+  if (plannedResults.length > 0) {
+    console.log("\n  --- PLAN FOLLOW-THROUGH ---")
+    console.log(
+      "  " +
+      "Model".padEnd(12) +
+      "Scenario".padEnd(10) +
+      "Mode".padEnd(17) +
+      "Style".padEnd(12) +
+      "Touches".padEnd(10) +
+      "Coverage"
+    )
+    console.log("  " + "-".repeat(72))
+
+    for (const r of plannedResults) {
+      const touches = r.plannedFileTouches !== undefined && r.plannedFiles
+        ? `${r.plannedFileTouches}/${r.plannedFiles.length}`
+        : "--"
+      const coverage = r.plannedFileCoverage !== undefined ? `${r.plannedFileCoverage}%` : "--"
+      console.log(
+        "  " +
+        r.modelLabel.padEnd(12) +
+        r.scenarioId.padEnd(10) +
+        r.planMode.padEnd(17) +
+        (r.planStyle || "--").padEnd(12) +
+        touches.padEnd(10) +
+        coverage
+      )
+    }
+  }
+
+  const checklistResults = results.filter(r => r.checklistTotalSteps !== undefined)
+  if (checklistResults.length > 0) {
+    console.log("\n  --- CHECKLIST PROGRESS ---")
+    console.log(
+      "  " +
+      "Model".padEnd(12) +
+      "Scenario".padEnd(10) +
+      "Mode".padEnd(24) +
+      "Done".padEnd(10) +
+      "Blocked".padEnd(10) +
+      "Progress".padEnd(10) +
+      "Checkoffs".padEnd(11) +
+      "ModGate".padEnd(10) +
+      "FinGate"
+    )
+    console.log("  " + "-".repeat(106))
+
+    for (const r of checklistResults) {
+      const done = r.checklistTotalSteps ? `${r.checklistCompletedSteps || 0}/${r.checklistTotalSteps}` : "--"
+      const blocked = `${r.checklistBlockedSteps || 0}`
+      const progress = r.checklistProgressPercent !== undefined ? `${r.checklistProgressPercent}%` : "--"
+      const checkoffs = `${r.checkoffCalls || 0}`
+      const modGate = `${r.modifyGateBlocks || 0}`
+      const finGate = `${r.finishGateBlocks || 0}`
+      console.log(
+        "  " +
+        r.modelLabel.padEnd(12) +
+        r.scenarioId.padEnd(10) +
+        r.planMode.padEnd(24) +
+        done.padEnd(10) +
+        blocked.padEnd(10) +
+        progress.padEnd(10) +
+        checkoffs.padEnd(11) +
+        modGate.padEnd(10) +
+        finGate
+      )
+    }
+  }
+
   // ── Delta report (planning vs no planning) ──
   const noneResults = results.filter(r => r.planMode === "none")
   const planResults = results.filter(r => r.planMode !== "none")
@@ -402,6 +644,22 @@ async function saveResults(results: ExperimentResult[]) {
   const ndjsonPath = path.join(RESULTS_DIR, "bench-log.ndjson")
   const lines = results.map(r => JSON.stringify({ ...r, timestamp: new Date().toISOString() })).join("\n") + "\n"
   await fs.appendFile(ndjsonPath, lines)
+}
+
+function normalizePathLike(filePath: string): string {
+  return filePath.replace(/`/g, "").trim().replace(/^\.\//, "")
+}
+
+function countPlannedFileMatches(plannedFiles: string[], touchedFiles: string[] = []): number {
+  const touched = new Set(touchedFiles.map(normalizePathLike))
+  let matches = 0
+
+  for (const plannedFile of plannedFiles.map(normalizePathLike)) {
+    const basename = plannedFile.split("/").pop() || plannedFile
+    if (touched.has(plannedFile) || touched.has(basename)) matches++
+  }
+
+  return matches
 }
 
 // ── Main ──────────────────────────────────────────────────────────────

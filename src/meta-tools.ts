@@ -6,6 +6,7 @@
  *   modify(file, old_text, new_text) → edit, write
  *   execute(command) → bash
  *   note(text) → scratchpad (survives context pressure)
+ *   checkoff(step, status) → checklist progress tracker
  *   finish(summary) → complete (with optional gate)
  *
  * The model thinks in intents; the router translates to real tools.
@@ -17,8 +18,8 @@ import { runSurgicalEditConveyor } from "./conveyor"
 
 // ── Meta-tool FC definitions ──────────────────────────────────────────
 
-export function getMetaToolDefs(): OpenAIToolDef[] {
-  return [
+export function getMetaToolDefs(options?: { includeCheckoff?: boolean; includeRegister?: boolean }): OpenAIToolDef[] {
+  const defs: OpenAIToolDef[] = [
     {
       type: "function",
       function: {
@@ -123,6 +124,66 @@ export function getMetaToolDefs(): OpenAIToolDef[] {
       },
     },
   ]
+
+  if (options?.includeRegister) {
+    defs.splice(defs.length - 1, 0, {
+      type: "function",
+      function: {
+        name: "register",
+        description: "Declare what I intend to do before I do it. I must register each file I plan to modify.",
+        parameters: {
+          type: "object",
+          properties: {
+            intent: {
+              type: "string",
+              description: "What I intend to do.",
+              enum: ["fix", "add", "refactor", "remove"],
+            },
+            file: {
+              type: "string",
+              description: "The file I will modify.",
+            },
+            reason: {
+              type: "string",
+              description: "Why I need to make this change (what I learned from exploration).",
+            },
+          },
+          required: ["intent", "file", "reason"],
+        },
+      },
+    })
+  }
+
+  if (options?.includeCheckoff) {
+    defs.splice(defs.length - 1, 0, {
+      type: "function",
+      function: {
+        name: "checkoff",
+        description: "Update checklist progress. Use when starting, completing, or getting blocked on a checklist step.",
+        parameters: {
+          type: "object",
+          properties: {
+            step: {
+              type: "string",
+              description: "The checklist step text you are updating. Use the exact step or its leading phrase.",
+            },
+            status: {
+              type: "string",
+              description: "Current status for that checklist step.",
+              enum: ["in_progress", "done", "blocked"],
+            },
+            note: {
+              type: "string",
+              description: "Optional short note explaining progress or the blocker.",
+            },
+          },
+          required: ["step", "status"],
+        },
+      },
+    })
+  }
+
+  return defs
 }
 
 // ── Meta-tool → real tool translation ─────────────────────────────────
@@ -185,26 +246,62 @@ function translateMetaCall(call: ToolCall): ToolCall[] {
 
 // ── Meta-tool executor ────────────────────────────────────────────────
 
+// ── Conveyor phase types ─────────────────────────────────────────────
+
+export type ConveyorPhase = "explore" | "execute" | "verify"
+
+export interface ConveyorRegistration {
+  intent: "fix" | "add" | "refactor" | "remove"
+  file: string
+  reason: string
+}
+
+export interface ConveyorPhaseState {
+  phase: ConveyorPhase
+  registrations: ConveyorRegistration[]
+  phaseTransitions: Array<{ from: string; to: string; turn: number }>
+  gateBlocks: number
+  verifyAttempts: number
+  loopBacks: number
+  testsPassed: boolean
+}
+
+// ── Meta-tool config ─────────────────────────────────────────────────
+
 export interface MetaToolConfig {
   baseExecutor: ToolExecutor
   testCmd?: string
   buggyFiles?: string[]
+  checklistSteps?: string[]
+  enableCheckoff?: boolean
+  requireCompletedStepForFinish?: boolean
+  requireInProgressStepForModify?: boolean
   /** SendWithTools for surgical edit conveyor stations (optional — falls back to direct edit) */
   sendWithTools?: SendWithToolsFn
   /** Model ID for conveyor station calls */
   model?: string
   /** Enable surgical edit conveyor for modify calls (default: true if sendWithTools provided) */
   surgicalConveyor?: boolean
+  /** Enable conveyor phase machine (explore → register → execute → verify) */
+  conveyorPhase?: boolean
 }
 
 export interface MetaExecutorState {
   notes: string[]
+  checklistSteps: Array<{ text: string; status: "pending" | "in_progress" | "done" | "blocked" }>
+  checkoffCalls: number
+  completedSteps: number
+  blockedSteps: number
+  progressPercent: number
+  modifyGateBlocks: number
+  finishGateBlocks: number
   consecutiveTestFails: number
   lastEditFile: string | null
   commandHistory: Array<{ sig: string; success: boolean }>
   surgicalEdits: number
   surgicalSuccesses: number
   directEditFallbacks: number
+  conveyor?: ConveyorPhaseState
 }
 
 export function createMetaToolExecutor(config: MetaToolConfig): {
@@ -216,12 +313,28 @@ export function createMetaToolExecutor(config: MetaToolConfig): {
 
   const state: MetaExecutorState = {
     notes: [],
+    checklistSteps: (config.checklistSteps || []).map(text => ({ text, status: "pending" })),
+    checkoffCalls: 0,
+    completedSteps: 0,
+    blockedSteps: 0,
+    progressPercent: 0,
+    modifyGateBlocks: 0,
+    finishGateBlocks: 0,
     consecutiveTestFails: 0,
     lastEditFile: null,
     commandHistory: [],
     surgicalEdits: 0,
     surgicalSuccesses: 0,
     directEditFallbacks: 0,
+    conveyor: config.conveyorPhase ? {
+      phase: "explore",
+      registrations: [],
+      phaseTransitions: [],
+      gateBlocks: 0,
+      verifyAttempts: 0,
+      loopBacks: 0,
+      testsPassed: false,
+    } : undefined,
   }
 
   const executor: ToolExecutor = {
@@ -230,6 +343,110 @@ export function createMetaToolExecutor(config: MetaToolConfig): {
 
       for (const call of calls) {
         const callSig = `${call.tool}:${JSON.stringify(call.args)}`
+
+        // ── Conveyor phase gating ──
+        if (state.conveyor) {
+          const cv = state.conveyor
+          const phase = cv.phase
+
+          // Register tool handler
+          if (call.tool === "register") {
+            const intent = (call.args.intent || "fix") as ConveyorRegistration["intent"]
+            const file = (call.args.file || "").replace(/`/g, "").trim()
+            const reason = call.args.reason || ""
+
+            if (!file) {
+              results.push({ tool: "register", success: false, output: "I must specify a file to register.", error: "Missing file" })
+              continue
+            }
+
+            cv.registrations.push({ intent, file, reason })
+
+            // Transition explore → execute on first registration
+            if (phase === "explore") {
+              cv.phaseTransitions.push({ from: "explore", to: "execute", turn: -1 })
+              cv.phase = "execute"
+              console.log(`    [conveyor] explore → execute (registered: ${file})`)
+            } else {
+              console.log(`    [conveyor] registered additional file: ${file} (phase: ${phase})`)
+            }
+
+            const fileList = cv.registrations.map(r => `${r.intent}: ${r.file}`).join(", ")
+            results.push({
+              tool: "register",
+              success: true,
+              output: `Registered: I will ${intent} ${file} — ${reason}. (${cv.registrations.length} files registered: ${fileList})`,
+            })
+            continue
+          }
+
+          // Phase gate checks
+          const normalizeFile = (f: string) => f.replace(/`/g, "").trim().replace(/^\.\//, "")
+
+          if (phase === "explore") {
+            if (call.tool === "modify") {
+              cv.gateBlocks++
+              results.push({ tool: "modify", success: false, output: "I haven't explored yet. I should investigate the code first, then call register to declare what I will change.", error: "Phase: explore — modify blocked" })
+              continue
+            }
+            if (call.tool === "execute") {
+              cv.gateBlocks++
+              results.push({ tool: "execute", success: false, output: "I should understand the problem before running commands. I need to investigate first.", error: "Phase: explore — execute blocked" })
+              continue
+            }
+            if (call.tool === "finish") {
+              cv.gateBlocks++
+              results.push({ tool: "finish", success: false, output: "I haven't done any work yet. I should explore, register, execute, then verify first.", error: "Phase: explore — finish blocked" })
+              continue
+            }
+          }
+
+          if (phase === "execute") {
+            if (call.tool === "modify") {
+              const modFile = normalizeFile(call.args.file || call.args.path || "")
+              const registered = cv.registrations.some(r => {
+                const regFile = normalizeFile(r.file)
+                const regBase = regFile.split("/").pop() || regFile
+                const modBase = modFile.split("/").pop() || modFile
+                return regFile === modFile || regBase === modBase
+              })
+              if (!registered) {
+                cv.gateBlocks++
+                results.push({
+                  tool: "modify",
+                  success: false,
+                  output: `I haven't registered ${modFile}. I should call register(intent, file, reason) first to declare my intent.`,
+                  error: "Phase: execute — unregistered file",
+                })
+                continue
+              }
+            }
+            if (call.tool === "finish") {
+              cv.gateBlocks++
+              results.push({ tool: "finish", success: false, output: "I need to verify my changes by running the tests before finishing.", error: "Phase: execute — finish blocked" })
+              continue
+            }
+          }
+
+          if (phase === "verify") {
+            if (call.tool === "modify") {
+              cv.gateBlocks++
+              results.push({ tool: "modify", success: false, output: "Tests failed — I should go back to exploring to understand why, not just retry the edit.", error: "Phase: verify — modify blocked" })
+              // Reset to explore on blocked modify during verify
+              cv.phase = "explore"
+              cv.registrations = []
+              cv.loopBacks++
+              cv.phaseTransitions.push({ from: "verify", to: "explore", turn: -1 })
+              console.log(`    [conveyor] verify → explore (loop-back #${cv.loopBacks}: modify attempted during verify)`)
+              continue
+            }
+            if (call.tool === "finish" && !cv.testsPassed) {
+              cv.gateBlocks++
+              results.push({ tool: "finish", success: false, output: "Tests haven't passed yet. I should run the test command first.", error: "Phase: verify — tests not passed" })
+              continue
+            }
+          }
+        }
 
         // ── Stuck detection: same failing command 3+ times ──
         const recentFails = state.commandHistory.filter(h => h.sig === callSig && !h.success)
@@ -254,6 +471,67 @@ export function createMetaToolExecutor(config: MetaToolConfig): {
             output: `Noted (${state.notes.length} total). Notes survive context compression.`,
           })
           continue
+        }
+
+        // ── Checklist progress tracker ──
+        if (call.tool === "checkoff") {
+          const stepText = (call.args.step || "").trim()
+          const status = (call.args.status || "in_progress") as "in_progress" | "done" | "blocked"
+          const note = (call.args.note || "").trim()
+
+          if (state.checklistSteps.length === 0) {
+            results.push({
+              tool: "checkoff",
+              success: false,
+              output: "No checklist is active for this run.",
+              error: "No checklist configured",
+            })
+            continue
+          }
+
+          const index = findChecklistStepIndex(state.checklistSteps.map(s => s.text), stepText)
+          if (index < 0) {
+            results.push({
+              tool: "checkoff",
+              success: false,
+              output: `Checklist step not recognized: ${stepText}`,
+              error: "Unknown checklist step",
+            })
+            continue
+          }
+
+          state.checkoffCalls++
+          state.checklistSteps[index].status = status
+          state.completedSteps = state.checklistSteps.filter(s => s.status === "done").length
+          state.blockedSteps = state.checklistSteps.filter(s => s.status === "blocked").length
+          state.progressPercent = Math.round((state.completedSteps / state.checklistSteps.length) * 100)
+
+          const parts = [
+            `Checklist progress: ${state.completedSteps}/${state.checklistSteps.length} done (${state.progressPercent}%)`,
+            `Updated step ${index + 1}: ${state.checklistSteps[index].text} -> ${status}`,
+          ]
+          if (note) parts.push(`Note: ${note}`)
+          results.push({
+            tool: "checkoff",
+            success: true,
+            output: parts.join("\n"),
+          })
+          continue
+        }
+
+        if (call.tool === "modify" && config.requireInProgressStepForModify && state.checklistSteps.length > 0) {
+          const hasInProgressStep = state.checklistSteps.some(step => step.status === "in_progress")
+          if (!hasInProgressStep) {
+            state.modifyGateBlocks++
+            results.push({
+              tool: "modify",
+              success: false,
+              output: "Modify blocked — first mark a checklist step in progress with checkoff(step=\"...\", status=\"in_progress\").",
+              error: "Checklist protocol requires an in-progress step before modifying code.",
+            })
+            state.commandHistory.push({ sig: callSig, success: false })
+            continue
+          }
         }
 
         // ── Surgical edit conveyor for modify calls ──
@@ -375,7 +653,8 @@ export function createMetaToolExecutor(config: MetaToolConfig): {
               [{ tool: "bash", args: { command: config.testCmd }, raw: "" }],
               context,
             )
-            if (testResult.output?.includes("tests passed") && !testResult.output?.includes("FAIL")) {
+            const autoTestPassed = !!testResult.output?.includes("tests passed") && !testResult.output?.includes("FAIL")
+            if (autoTestPassed) {
               results.push({ ...testResult, tool: "auto-test" })
             } else {
               results.push({
@@ -384,10 +663,70 @@ export function createMetaToolExecutor(config: MetaToolConfig): {
                 output: `[Auto-test] ${config.testCmd}: ${testResult.output?.slice(0, 2000)}`,
               })
             }
+
+            // Conveyor: auto-test transitions execute → verify
+            if (state.conveyor && state.conveyor.phase === "execute") {
+              state.conveyor.phase = "verify"
+              state.conveyor.verifyAttempts++
+              state.conveyor.phaseTransitions.push({ from: "execute", to: "verify", turn: -1 })
+              console.log(`    [conveyor] execute → verify via auto-test (${autoTestPassed ? "PASSED" : "FAILED"})`)
+              if (autoTestPassed) {
+                state.conveyor.testsPassed = true
+              } else {
+                state.conveyor.testsPassed = false
+                state.conveyor.phase = "explore"
+                state.conveyor.registrations = []
+                state.conveyor.loopBacks++
+                state.conveyor.phaseTransitions.push({ from: "verify", to: "explore", turn: -1 })
+                console.log(`    [conveyor] verify → explore (loop-back #${state.conveyor.loopBacks}: auto-test failed)`)
+              }
+            }
+          }
+        }
+
+        // ── Conveyor: detect test execution and transition phases ──
+        if (state.conveyor && call.tool === "execute") {
+          const cv = state.conveyor
+          const cmd = (call.args.command || "").trim()
+          const isTestCmd = config.testCmd && cmd.includes(config.testCmd)
+          const lastResult = results[results.length - 1]
+
+          if (isTestCmd && lastResult) {
+            const testPassed = lastResult.success && lastResult.output?.includes("tests passed") && !lastResult.output?.includes("FAIL")
+
+            if (cv.phase === "execute") {
+              cv.phase = "verify"
+              cv.verifyAttempts++
+              cv.phaseTransitions.push({ from: "execute", to: "verify", turn: -1 })
+              console.log(`    [conveyor] execute → verify (test ${testPassed ? "PASSED" : "FAILED"})`)
+            }
+
+            if (testPassed) {
+              cv.testsPassed = true
+            } else if (cv.phase === "verify") {
+              // Test failed during verify — loop back to explore
+              cv.testsPassed = false
+              cv.phase = "explore"
+              cv.registrations = []
+              cv.loopBacks++
+              cv.phaseTransitions.push({ from: "verify", to: "explore", turn: -1 })
+              console.log(`    [conveyor] verify → explore (loop-back #${cv.loopBacks}: test failed)`)
+            }
           }
         }
 
         // ── Finish gate: verify tests pass before accepting ──
+        if (call.tool === "finish" && config.requireCompletedStepForFinish && state.checklistSteps.length > 0 && state.completedSteps === 0) {
+          state.finishGateBlocks++
+          results[results.length - 1] = {
+            tool: "finish",
+            success: false,
+            output: "Finish blocked — mark at least one checklist step done with checkoff(step=\"...\", status=\"done\") before finishing.",
+            error: "Checklist protocol requires at least one completed step before finishing.",
+          }
+          continue
+        }
+
         if (call.tool === "finish" && config.testCmd) {
           const [gateResult] = await config.baseExecutor.executeAll(
             [{ tool: "bash", args: { command: config.testCmd }, raw: "" }],
@@ -410,5 +749,25 @@ export function createMetaToolExecutor(config: MetaToolConfig): {
     },
   }
 
-  return { executor, tools: getMetaToolDefs(), state }
+  return {
+    executor,
+    tools: getMetaToolDefs({
+      includeCheckoff: !!config.enableCheckoff,
+      includeRegister: !!config.conveyorPhase,
+    }),
+    state,
+  }
+}
+
+function findChecklistStepIndex(steps: string[], query: string): number {
+  const normalizedQuery = query.trim().toLowerCase()
+  if (!normalizedQuery) return -1
+
+  const exact = steps.findIndex(step => step.trim().toLowerCase() === normalizedQuery)
+  if (exact >= 0) return exact
+
+  const contains = steps.findIndex(step => step.trim().toLowerCase().includes(normalizedQuery))
+  if (contains >= 0) return contains
+
+  return steps.findIndex(step => normalizedQuery.includes(step.trim().toLowerCase().slice(0, Math.min(step.length, 24))))
 }

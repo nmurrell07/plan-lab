@@ -81,6 +81,18 @@ All systems are wired into the runner and fire on every turn:
 | **Stall nudge** | runner.ts | Context-aware nudge on empty responses | Empty turns don't count; 9B recovers ~50% of wasted turns |
 | **Text-to-FC recovery** | conveyor.ts | Recovers tool calls from model text | Channel markers, regex, JSON patterns |
 
+## Prompt Perspective: First-Person Omniscient
+
+All prompts, system messages, plans, and nudges sent to any agent must be written in first-person omniscient voice. The agent should perceive the task as its own intent, not as an external request from "the user." Write "I need to fix the bug in parser.js" — not "The user wants you to fix the bug in parser.js." This shifts the model from servant-following-orders to protagonist-with-a-goal, which improves task ownership and reduces drift in small models.
+
+This applies at every layer — including Evo. When Evo generates plans, reviews explorer output, or refines worker findings, it should frame itself as the architect owning the problem ("I need to produce a plan that solves...", "My explorers found..."), not as a middleman relaying a user's request.
+
+**Evo as inner voice**: When Evo injects nudges, corrections, or guidance into a worker's context, it must write as the worker's own inner monologue — not as commands from an external authority. Write "I've been reading the same file twice — I should try grep to find the actual entry point" instead of "Stop repeating yourself and try a different approach." Evo imitates the worker's thought process, planting realizations rather than issuing orders. The worker should never feel directed; it should feel like it had the idea itself.
+
+## No Knowledge Seeding
+
+Experiments must measure whether **planning as a mechanism** improves outcomes — not whether giving the model insider knowledge helps. Never leak solution hints, file contents, bug locations, or fix strategies into plans, prompts, or system messages during development and testing. If a tweak only works because it smuggles the answer to the model, it teaches nothing about planning. Every improvement must come from process, not clues.
+
 ## Key Lessons Learned
 
 1. **Plan paths must not have backticks** — small models copy markdown formatting literally into tool calls

@@ -15,8 +15,46 @@
 
 import fs from "fs/promises"
 import path from "path"
+import { execSync } from "child_process"
 import type { ChatMessage, OpenAIToolDef, SendWithToolsFn } from "./client"
 import type { ToolCallResult } from "./tools"
+
+// ── Station 5: Syntax validation ─────────────────────────────────────
+
+export interface ValidationResult {
+  valid: boolean
+  error?: string
+  /** Normalized bucket key for the failure ledger */
+  bucket?: string
+}
+
+const VALIDATION_EXTENSIONS = new Set([".js", ".mjs", ".cjs", ".jsx"])
+
+/**
+ * Validate file content before committing to disk.
+ * Returns { valid: true } or { valid: false, error, bucket }.
+ */
+export function validateSyntax(content: string, filePath: string): ValidationResult {
+  const ext = path.extname(filePath).toLowerCase()
+  if (!VALIDATION_EXTENSIONS.has(ext)) return { valid: true }
+
+  try {
+    execSync("node --check -", { input: content, encoding: "utf-8", timeout: 5000, stdio: ["pipe", "pipe", "pipe"] })
+    return { valid: true }
+  } catch (err: any) {
+    const stderr = err.stderr || ""
+    const firstLines = stderr.split("\n").slice(0, 4).join("\n").trim()
+
+    // Classify the error for ledger bucketing
+    let bucket = "syntax_unknown"
+    if (/unexpected (token|identifier)/i.test(stderr)) bucket = "syntax_unexpected_token"
+    else if (/unterminated|unexpected end/i.test(stderr)) bucket = "syntax_unterminated"
+    else if (/duplicate/i.test(stderr)) bucket = "syntax_duplicate"
+    else if (/unexpected string/i.test(stderr)) bucket = "syntax_unexpected_string"
+
+    return { valid: false, error: firstLines, bucket }
+  }
+}
 
 // ── Station answer tool ───────────────────────────────────────────────
 
@@ -275,25 +313,82 @@ export async function runSurgicalEditConveyor(
     .replace(/^```\w*\n?/, "")
     .replace(/\n?```$/, "")
 
-  // Re-read file (may have changed since Station 2)
-  try {
-    fileContent = await fs.readFile(resolved, "utf-8")
-  } catch {
-    return { tool: "edit", success: false, output: "", error: `File disappeared: ${file}` }
+  // ── Station 5: Validate + retry loop ──
+  const MAX_STATION5_RETRIES = 1
+
+  for (let s5attempt = 0; s5attempt <= MAX_STATION5_RETRIES; s5attempt++) {
+    // Re-read file (may have changed since Station 2 or previous attempt)
+    try {
+      fileContent = await fs.readFile(resolved, "utf-8")
+    } catch {
+      return { tool: "edit", success: false, output: "", error: `File disappeared: ${file}` }
+    }
+
+    // Apply the edit
+    const freshLines = fileContent.split("\n")
+    const newLines = cleanReplacement.split("\n")
+    freshLines.splice(startIdx, removeCount, ...newLines)
+
+    const newContent = freshLines.join("\n")
+
+    // Validate
+    const validation = validateSyntax(newContent, file)
+    if (validation.valid) {
+      await fs.writeFile(resolved, newContent, "utf-8")
+      return {
+        tool: "edit",
+        success: true,
+        output: `Replaced lines ${startLine}-${endLine} in ${file} (${removeCount} lines -> ${newLines.length} lines)`,
+      }
+    }
+
+    // Validation failed
+    const bucketTag = validation.bucket || "syntax_unknown"
+    console.log(`    [surgical] Station 5 FAILED (${bucketTag}, attempt ${s5attempt + 1}/${MAX_STATION5_RETRIES + 1}): ${validation.error?.slice(0, 80)}`)
+
+    // If we have retries left, ask the model for a corrected replacement
+    if (s5attempt < MAX_STATION5_RETRIES && sendWithTools) {
+      const correctionPrompt = [
+        `My replacement code for lines ${startLine}-${endLine} in ${file} has a syntax error:`,
+        "",
+        validation.error,
+        "",
+        `Original lines I am replacing:`,
+        oldText,
+        "",
+        `My broken replacement:`,
+        cleanReplacement,
+        "",
+        `I need to fix the syntax error. Write the corrected replacement code only — no explanation, no markdown fences.`,
+      ].join("\n")
+
+      const corrected = await askStationValue(
+        messages,
+        correctionPrompt,
+        "corrected_code",
+        sendWithTools,
+        model,
+        0, // no retries within the retry
+      )
+
+      if (corrected?.trim()) {
+        cleanReplacement = corrected.replace(/^```\w*\n?/, "").replace(/\n?```$/, "")
+        console.log(`    [surgical] Station 5 retry: got corrected replacement (${cleanReplacement.length} chars)`)
+        continue
+      }
+    }
+
+    // Out of retries — fail with bucket info for the ledger
+    return {
+      tool: "edit",
+      success: false,
+      output: `Edit would create a syntax error in ${file} — rolling back. Error: ${validation.error}`,
+      error: `Surgical edit produced invalid syntax [${bucketTag}]`,
+    }
   }
 
-  // Apply the edit
-  const freshLines = fileContent.split("\n")
-  const newLines = cleanReplacement.split("\n")
-  freshLines.splice(startIdx, removeCount, ...newLines)
-
-  await fs.writeFile(resolved, freshLines.join("\n"), "utf-8")
-
-  return {
-    tool: "edit",
-    success: true,
-    output: `Replaced lines ${startLine}-${endLine} in ${file} (${removeCount} lines -> ${newLines.length} lines)`,
-  }
+  // Should not reach here, but just in case
+  return { tool: "edit", success: false, output: "", error: "Station 5: unexpected exit" }
 }
 
 // ── Text-to-FC Recovery ───────────────────────────────────────────────
