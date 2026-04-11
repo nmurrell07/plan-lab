@@ -17,6 +17,8 @@
  *   REVIEW_LOOPS  Max specialist review/refine loops (default: 2)
  *   VERBOSE       Set to 1 for full transcript
  *   PLAN_MODE     scaffold_plan | evo_plan | none (default: scaffold_plan)
+ *   BLIND_MODE    1 (default) = model sees ONLY the original issue description (not PR body, diff, or comments)
+ *                 0 = include the diff (original behavior)
  *   ITERATE_UNTIL_IMPROVEMENT  Set to 1 for performance iteration mode
  *   MAX_ITERATIONS  Max performance iterations (default: 5)
  */
@@ -53,7 +55,18 @@ const PLAN_MODE = process.env.PLAN_MODE || "scaffold_plan"
 const ITERATE_UNTIL_IMPROVEMENT = process.env.ITERATE_UNTIL_IMPROVEMENT === "1"
 const MAX_ITERATIONS = parseInt(process.env.MAX_ITERATIONS || "5", 10)
 
+// Blind mode: model sees ONLY the original issue description — no PR body, no diff,
+// no reviewer comments. The specialist review is the ONLY feedback mechanism.
+// The original diff is fetched post-hoc for comparison only.
+const BLIND_MODE = process.env.BLIND_MODE !== "0"  // ON by default
+
 // ── Types ───────────────────────────────────────────────────────────────
+
+interface LinkedIssue {
+  number: number
+  title: string
+  body: string
+}
 
 interface PRIntake {
   owner: string
@@ -68,6 +81,7 @@ interface PRIntake {
   filesChanged: Array<{ path: string; additions: number; deletions: number }>
   reviewComments: Array<{ author: string; body: string; path?: string; line?: number }>
   issueComments: Array<{ author: string; body: string }>
+  linkedIssues: LinkedIssue[]
 }
 
 interface SpecialistFeedback {
@@ -79,13 +93,21 @@ interface SpecialistFeedback {
 interface PipelineResult {
   pr: { owner: string; repo: string; number: number; title: string }
   workDir: string
+  blindMode: boolean
   phases: {
     intake: { ok: boolean; error?: string }
     workspace: { ok: boolean; branch?: string; error?: string }
     plan: { ok: boolean; plan?: string; tokenCost?: number; error?: string }
     execution: { ok: boolean; turns?: number; tokens?: number; filesModified?: boolean; error?: string }
     review: { loops: number; feedback: SpecialistFeedback[]; error?: string }
-    comparison: { originalDiff?: string; newDiff?: string; error?: string }
+    comparison: {
+      originalDiff?: string
+      newDiff?: string
+      sameFiles?: boolean
+      sameFix?: boolean
+      reviewerFeedbackCaught?: boolean
+      error?: string
+    }
   }
   iterations?: number
   durationSec: number
@@ -132,6 +154,39 @@ function parsePRInput(args: string[]): { owner: string; repo: string; number: nu
     "Usage: bun run src/pr-pipeline.ts <owner/repo> <pr-number>\n" +
     "   or: bun run src/pr-pipeline.ts <github-pr-url>"
   )
+}
+
+/** Extract #NNNN references from text, excluding the PR's own number */
+function extractIssueRefs(text: string, excludeNumber: number): number[] {
+  const refs = new Set<number>()
+  const re = /#(\d+)/g
+  let match
+  while ((match = re.exec(text)) !== null) {
+    const num = parseInt(match[1], 10)
+    if (num !== excludeNumber && num > 0) refs.add(num)
+  }
+  return Array.from(refs)
+}
+
+/** Fetch original issue descriptions from GitHub */
+async function fetchLinkedIssues(owner: string, repo: string, issueNumbers: number[]): Promise<LinkedIssue[]> {
+  const fullRepo = `${owner}/${repo}`
+  const issues: LinkedIssue[] = []
+
+  for (const num of issueNumbers) {
+    try {
+      const json = shellExec(`gh issue view ${num} -R ${fullRepo} --json body,title`)
+      const parsed = JSON.parse(json)
+      if (parsed.title || parsed.body) {
+        issues.push({ number: num, title: parsed.title || "", body: parsed.body || "" })
+        console.log(`  [intake] Fetched linked issue #${num}: ${(parsed.title || "").slice(0, 80)}`)
+      }
+    } catch (err: any) {
+      console.log(`  [intake] Could not fetch issue #${num}: ${err.message?.slice(0, 80)}`)
+    }
+  }
+
+  return issues
 }
 
 async function intakePR(owner: string, repo: string, number: number): Promise<PRIntake> {
@@ -190,6 +245,14 @@ async function intakePR(owner: string, repo: string, number: number): Promise<PR
     deletions: f.deletions || 0,
   }))
 
+  // Fetch linked issues (from PR body and title)
+  const issueRefs = extractIssueRefs((pr.body || "") + " " + (pr.title || ""), number)
+  let linkedIssues: LinkedIssue[] = []
+  if (issueRefs.length > 0) {
+    console.log(`  [intake] Found issue references: ${issueRefs.map(n => `#${n}`).join(", ")}`)
+    linkedIssues = await fetchLinkedIssues(owner, repo, issueRefs)
+  }
+
   const intake: PRIntake = {
     owner,
     repo,
@@ -203,6 +266,7 @@ async function intakePR(owner: string, repo: string, number: number): Promise<PR
     filesChanged,
     reviewComments,
     issueComments,
+    linkedIssues,
   }
 
   console.log(`  [intake] Title: ${intake.title}`)
@@ -210,6 +274,7 @@ async function intakePR(owner: string, repo: string, number: number): Promise<PR
   console.log(`  [intake] Files changed: ${filesChanged.length}`)
   console.log(`  [intake] Review comments: ${reviewComments.length}`)
   console.log(`  [intake] Issue comments: ${issueComments.length}`)
+  console.log(`  [intake] Linked issues: ${linkedIssues.length}`)
   console.log(`  [intake] Diff size: ${diff.length} chars`)
 
   return intake
@@ -260,9 +325,115 @@ async function setupWorkspace(intake: PRIntake): Promise<string> {
 
 // ── Phase 3: Plan Generation ────────────────────────────────────────────
 
+// ── Blind-mode helpers ─────────────────────────────────────────────────
+
+/** Strip solution hints from PR description — remove diff blocks, code blocks showing fixes,
+ * and inline text that reveals the exact code change. The model should only know WHAT the
+ * problem is, not HOW it was fixed. */
+function sanitizeDescription(body: string, budget: number): string {
+  let text = body
+
+  // Remove diff code blocks (```diff ... ```)
+  text = text.replace(/```diff[\s\S]*?```/g, "[diff removed for blind evaluation]")
+
+  // Remove code blocks that look like they contain the fix
+  // Keep code blocks that describe the problem (e.g., error output, repro steps)
+  text = text.replace(/```[\w]*\n[\s\S]*?```/g, (match) => {
+    // Keep blocks that look like error output / stack traces
+    if (/error|traceback|exception|stack|panic|segfault/i.test(match)) return match
+    // Strip blocks that look like they show the fix
+    if (/object\.create|__proto__|parsed\s*=|changed.*to|replaced.*with/i.test(match)) {
+      return "[code block removed for blind evaluation]"
+    }
+    // Keep short blocks (likely examples), strip long ones (likely solutions)
+    return match.length < 200 ? match : "[code block removed for blind evaluation]"
+  })
+
+  // Remove inline sentences that describe the exact fix (e.g., "by changing X to Y")
+  // These patterns reveal the solution:
+  text = text.replace(/by\s+chang(ing|ed?)\s+`[^`]+`\s+to\s+`[^`]+`/gi, "[specific fix details removed]")
+  text = text.replace(/chang(ing|ed?)\s+`[^`]+`\s+to\s+`[^`]+`/gi, "[specific fix details removed]")
+  text = text.replace(/replac(ing|ed?)\s+`[^`]+`\s+with\s+`[^`]+`/gi, "[specific fix details removed]")
+  text = text.replace(/from\s+`[^`]+`\s+to\s+`[^`]+`/gi, "[specific change removed]")
+
+  // Remove "Summary of changes" sections that describe exactly what was changed
+  text = text.replace(/[-*]\s*Use\s+`[^`]+`\s+(?:for|instead\s+of|in\s+place\s+of)\s+[^\n]*/gi, "[change detail removed]")
+
+  // Remove auto-generated "Description" sections from bots that spell out the fix
+  text = text.replace(/##\s*Description[\s\S]*?(?=##|\z)/gi, (match) => {
+    // Keep it only if it describes the problem, not the solution
+    if (/summary\s+of\s+changes|reasoning/i.test(match)) {
+      return "[auto-generated description removed for blind evaluation]"
+    }
+    return match
+  })
+
+  // Truncate to budget
+  if (text.length > budget) {
+    text = text.slice(0, budget) + "\n... (truncated)"
+  }
+
+  return text
+}
+
+/** Collect all feedback from reviews and issue comments */
+function collectFeedback(intake: PRIntake) {
+  return [
+    ...intake.reviewComments.map(c => ({
+      ...c,
+      source: "review" as const,
+    })),
+    ...intake.issueComments.map(c => ({
+      ...c,
+      source: "comment" as const,
+    })),
+  ]
+}
+
 function buildTaskFromPR(intake: PRIntake): string {
   const lines: string[] = []
 
+  if (BLIND_MODE) {
+    // ── Truly blind mode: ONLY the original issue description ──
+    // No PR body, no diff, no reviewer comments, no file hints.
+    // The model discovers everything through exploration.
+    // The specialist review (post-execution) is the ONLY feedback mechanism.
+    lines.push(`I need to fix a reported issue in ${intake.owner}/${intake.repo}.`)
+    lines.push("")
+
+    // Use the linked issue body if available — this is the original bug report
+    // with no solution information. Falls back to PR title only if no issues found.
+    if (intake.linkedIssues.length > 0) {
+      for (const issue of intake.linkedIssues) {
+        lines.push(`## Issue #${issue.number}: ${issue.title}`)
+        lines.push("")
+        // The original issue body — no sanitization needed because this is
+        // the reporter's description, not the PR author's solution.
+        // However, some issues (like #7538) may contain the fix — strip those.
+        const issueBody = sanitizeDescription(issue.body, CONTEXT_BUDGET)
+        lines.push(issueBody)
+        lines.push("")
+      }
+    } else {
+      // No linked issues found — fall back to just the PR title (no body)
+      lines.push("## Issue Description")
+      lines.push(intake.title)
+      lines.push("")
+    }
+
+    lines.push("## My Approach")
+    lines.push("I will:")
+    lines.push("1. Explore the codebase to understand the project structure")
+    lines.push("2. Find the code related to the reported issue")
+    lines.push("3. Investigate the root cause by reading the relevant source files")
+    lines.push("4. Develop a fix that addresses the issue without introducing side effects")
+    lines.push("5. Verify the changes make sense")
+    lines.push("6. Call complete when done")
+
+    return lines.join("\n")
+  }
+
+  // ── Non-blind mode: original behavior with diff ──
   lines.push(`I need to re-implement the changes from PR #${intake.number}: "${intake.title}".`)
   lines.push("")
 
@@ -283,16 +454,7 @@ function buildTaskFromPR(intake: PRIntake): string {
   }
 
   // Reviewer feedback as constraints
-  const allFeedback = [
-    ...intake.reviewComments.map(c => ({
-      ...c,
-      source: "review" as const,
-    })),
-    ...intake.issueComments.map(c => ({
-      ...c,
-      source: "comment" as const,
-    })),
-  ]
+  const allFeedback = collectFeedback(intake)
 
   if (allFeedback.length > 0) {
     const maxFeedback = CONTEXT_BUDGET < 3000 ? 3 : 10
@@ -361,6 +523,29 @@ async function generatePlan(
 
 // ── Phase 4: Execution ──────────────────────────────────────────────────
 
+const BLIND_SYSTEM_PROMPT = `I am a senior developer fixing a reported issue. I have only the original issue description. I need to explore the codebase, find the root cause, and implement a clean fix entirely on my own.
+
+I have these tools:
+- read(path) -- read a file, returns numbered lines
+- write(path, content) -- create a new file with full content
+- edit(path, old_string, new_string) -- find exact text in a file and replace it
+- grep(pattern) -- search for a regex pattern across the codebase
+- bash(command) -- run a shell command (already in the project directory)
+- list(path) -- list directory contents
+- glob(pattern) -- find files by name pattern
+- complete(summary) -- signal I am done
+
+My rules:
+- All paths are RELATIVE to the project root (e.g. "src/index.ts"), never absolute
+- For edit: old_string must be an EXACT copy of text currently in the file
+- For write: I provide the COMPLETE file content
+- Shell commands run in the project directory. I do NOT prefix with cd.
+- I start by exploring the project structure to understand what I am working with
+- I investigate thoroughly before making changes -- read the code, understand the patterns
+- I make minimal, targeted changes -- I do not refactor unrelated code
+- I verify my changes make sense before calling complete
+- I work step by step: explore, understand, then fix`
+
 const BASE_SYSTEM_PROMPT = `I am a senior developer re-implementing a PR. I have the original PR's intent and reviewer feedback as constraints.
 
 I have these tools:
@@ -395,7 +580,7 @@ async function executePass(
     timeoutMs: 300000,
   })
 
-  let systemPrompt = BASE_SYSTEM_PROMPT
+  let systemPrompt = BLIND_MODE ? BLIND_SYSTEM_PROMPT : BASE_SYSTEM_PROMPT
   if (plan) {
     systemPrompt = injectPlanIntoPrompt(systemPrompt, plan, workDir)
   }
@@ -432,20 +617,24 @@ async function executePass(
     evoObserve: PLAN_MODE !== "none" ? { send, model: MODEL, intervalTurns: 3 } : undefined,
   })
 
-  // Capture diff
+  // Capture diff — commit model's changes and diff against the pre-execution state
   let diff = ""
   try {
-    diff = shellExec(`git -C ${JSON.stringify(workDir)} diff HEAD`, { cwd: workDir })
-    if (!diff) {
-      // Maybe changes are staged or committed
-      diff = shellExec(`git -C ${JSON.stringify(workDir)} diff --cached HEAD`, { cwd: workDir })
+    // Stage and commit model's changes so we have a clean diff
+    const wd = JSON.stringify(workDir)
+    try {
+      shellExec(`git -C ${wd} add -A`)
+      shellExec(`git -C ${wd} diff --cached --stat`)
+      shellExec(`git -C ${wd} commit -m "pipeline execution" --allow-empty`)
+    } catch {
+      // May fail if nothing changed
     }
+    // Diff between the branch creation point and now
+    diff = shellExec(`git -C ${wd} diff HEAD~1..HEAD 2>/dev/null || git -C ${wd} diff HEAD`)
     if (!diff) {
-      // Try diff against the initial commit
-      diff = shellExec(`git -C ${JSON.stringify(workDir)} diff $(git -C ${JSON.stringify(workDir)} rev-list --max-parents=0 HEAD) HEAD`, { cwd: workDir })
+      diff = shellExec(`git -C ${wd} status --short`)
     }
   } catch {
-    // Fallback: show file changes
     try {
       diff = shellExec(`git -C ${JSON.stringify(workDir)} status --short`)
     } catch {
@@ -495,6 +684,7 @@ async function runSpecialistReview(
     baseUrl: ENDPOINT,
     model: MODEL,
     temperature: 0,
+    maxTokens: 1024,
     timeoutMs: 300000,
   })
 
@@ -517,14 +707,19 @@ async function runSpecialistReview(
         MODEL,
       )
 
-      const text = result.content || result.text || ""
+      let text = result.content || result.text || ""
+      // Strip thinking blocks from qwen models
+      text = text.replace(/<think>[\s\S]*?<\/think>/g, "").trim()
+
       const findings = text
         .split("\n")
         .filter((line: string) => line.trim().startsWith("-") || line.trim().startsWith("*"))
         .map((line: string) => line.replace(/^[-*]\s*/, "").trim())
         .filter((line: string) => line.length > 5)
 
-      const noIssues = /no\s+(issues?|problems?|concerns?)\s+found/i.test(text)
+      const noIssues = /no\s+(issues?|problems?|concerns?)\s+found/i.test(text) ||
+        /looks?\s+good/i.test(text) || /no\s+actionable/i.test(text) ||
+        (findings.length === 0 && text.length < 200)
       const severity = noIssues ? "info" as const
         : findings.some((f: string) => /critical|security|vulnerability|crash|data loss/i.test(f)) ? "critical" as const
         : "warning" as const
@@ -563,9 +758,19 @@ function formatFeedbackAsConstraints(feedback: SpecialistFeedback[]): string | n
 
 // ── Phase 6: Comparison ─────────────────────────────────────────────────
 
-function printComparison(originalDiff: string, newDiff: string): void {
+interface ComparisonResult {
+  sameFiles: boolean
+  sameFix: boolean
+  origFiles: string[]
+  newFiles: string[]
+  commonFiles: string[]
+}
+
+function printComparison(originalDiff: string, newDiff: string): ComparisonResult {
   console.log("\n" + "=".repeat(70))
-  console.log("  COMPARISON: Original PR vs Pipeline Output")
+  console.log(BLIND_MODE
+    ? "  BLIND COMPARISON: Original PR vs Model's Independent Fix"
+    : "  COMPARISON: Original PR vs Pipeline Output")
   console.log("=".repeat(70))
 
   const origStats = diffStats(originalDiff)
@@ -590,6 +795,8 @@ function printComparison(originalDiff: string, newDiff: string): void {
   const onlyOrig = origFiles.filter(f => !newFiles.includes(f))
   const onlyNew = newFiles.filter(f => !origFiles.includes(f))
 
+  const sameFiles = common.length > 0 && common.length === origFiles.length && origFiles.length === newFiles.length
+
   if (common.length > 0) {
     console.log(`\n  Common files (${common.length}):`)
     for (const f of common) console.log(`    - ${f}`)
@@ -603,7 +810,33 @@ function printComparison(originalDiff: string, newDiff: string): void {
     for (const f of onlyNew) console.log(`    - ${f}`)
   }
 
+  // Blind mode: check if the fix is structurally similar
+  // A simple heuristic: extract the actual changed lines (not file headers)
+  const origChangedLines = extractChangedLines(originalDiff)
+  const newChangedLines = extractChangedLines(newDiff)
+  const sameFix = origChangedLines.length > 0 && newChangedLines.length > 0 &&
+    origChangedLines.some(ol => newChangedLines.some(nl =>
+      // Fuzzy match: same key tokens appear
+      ol.split(/\s+/).filter(t => t.length > 3).some(token =>
+        nl.includes(token)
+      )
+    ))
+
+  if (BLIND_MODE) {
+    console.log(`\n  Blind evaluation:`)
+    console.log(`    Same files modified: ${sameFiles ? "YES" : "NO"}`)
+    console.log(`    Structurally similar fix: ${sameFix ? "LIKELY" : "DIFFERENT APPROACH"}`)
+    if (sameFix) {
+      console.log(`    >> Model arrived at a similar fix independently`)
+    } else if (common.length > 0) {
+      console.log(`    >> Model touched the right files but took a different approach`)
+    } else {
+      console.log(`    >> Model fixed different files entirely`)
+    }
+  }
+
   console.log("\n" + "=".repeat(70))
+  return { sameFiles, sameFix, origFiles, newFiles, commonFiles: common }
 }
 
 function diffStats(diff: string): { files: number; additions: number; deletions: number } {
@@ -619,6 +852,86 @@ function extractDiffFiles(diff: string): string[] {
     .filter(l => l.startsWith("diff --git"))
     .map(l => l.split(" b/")[1])
     .filter(Boolean)
+}
+
+/** Extract actual changed lines (additions) from a diff, excluding headers and lock files */
+function extractChangedLines(diff: string): string[] {
+  const lines = diff.split("\n")
+  const changed: string[] = []
+  let currentFile = ""
+
+  for (const line of lines) {
+    if (line.startsWith("diff --git")) {
+      currentFile = line.split(" b/")[1] || ""
+    }
+    // Skip lock files and package-lock changes
+    if (currentFile.includes("lock.json") || currentFile.includes("lock.yaml")) continue
+    // Collect additions (not headers)
+    if (line.startsWith("+") && !line.startsWith("+++") && line.trim().length > 3) {
+      changed.push(line.slice(1).trim())
+    }
+  }
+  return changed
+}
+
+// ── Post-hoc blind comparison with LLM ─────────────────────────────────
+
+async function runBlindComparisonReview(
+  originalDiff: string,
+  newDiff: string,
+  task: string,
+  specialistFeedback: SpecialistFeedback[],
+  originalReviewComments: PRIntake["reviewComments"],
+): Promise<{ reviewerFeedbackCaught: boolean; analysis: string }> {
+  const send = createSendWithTools({
+    baseUrl: ENDPOINT,
+    model: MODEL,
+    temperature: 0,
+    maxTokens: 1500,
+    timeoutMs: 300000,
+  })
+
+  console.log(`  [blind-compare] Running post-hoc analysis...`)
+
+  // Format original reviewer concerns
+  const originalConcerns = originalReviewComments
+    .map(c => `- ${c.author}: ${c.body.slice(0, 300)}`)
+    .join("\n")
+
+  // Format specialist findings
+  const specialistFindings = specialistFeedback
+    .filter(f => f.severity !== "info")
+    .map(f => `[${f.role}]: ${f.findings.join("; ")}`)
+    .join("\n")
+
+  try {
+    const result = await send(
+      "blind comparator",
+      [
+        {
+          role: "system",
+          content: `I am analyzing a blind re-implementation experiment. A model was given an issue description WITHOUT seeing the original PR's diff, and asked to independently fix the bug. I need to compare the original fix with the model's fix and check whether the specialist review caught the same issues that real reviewers caught.`,
+        },
+        {
+          role: "user",
+          content: `## Task Description\n${task.slice(0, 1000)}\n\n## Original PR Diff\n\`\`\`diff\n${originalDiff.slice(0, 3000)}\n\`\`\`\n\n## Model's Blind Fix Diff\n\`\`\`diff\n${newDiff.slice(0, 3000)}\n\`\`\`\n\n## Original Reviewer Comments\n${originalConcerns || "(none)"}\n\n## Specialist Review Findings\n${specialistFindings || "(none)"}\n\nAnalyze:\n1. Did the model find and fix the SAME root cause as the original PR?\n2. Did the specialist review catch the SAME issues that original reviewers flagged?\n3. How does the model's approach compare? (same, different-but-valid, wrong)\n\nBe concrete and specific. Reference actual code changes.`,
+        },
+      ],
+      [],
+      MODEL,
+    )
+
+    let text = result.content || result.text || ""
+    // Strip thinking blocks from qwen models
+    text = text.replace(/<think>[\s\S]*?<\/think>/g, "").trim()
+    const reviewerFeedbackCaught = /caught|identified|flagged|found.*same|similar.*issue/i.test(text)
+
+    console.log(`  [blind-compare] Reviewer feedback caught: ${reviewerFeedbackCaught ? "YES" : "NO"}`)
+    return { reviewerFeedbackCaught, analysis: text }
+  } catch (err: any) {
+    console.log(`  [blind-compare] Analysis failed: ${err.message?.slice(0, 80)}`)
+    return { reviewerFeedbackCaught: false, analysis: `Failed: ${err.message?.slice(0, 200)}` }
+  }
 }
 
 // ── Performance Iteration Mode ──────────────────────────────────────────
@@ -638,13 +951,17 @@ async function iterateUntilImprovement(
     iterations = i + 1
     console.log(`\n  [iterate] === Iteration ${iterations} ===`)
 
-    // Reset workspace for each iteration (keep .git)
+    // Reset workspace to pre-execution baseline for each iteration
     if (i > 0) {
       try {
-        shellExec(`git -C ${JSON.stringify(workDir)} checkout .`)
-        shellExec(`git -C ${JSON.stringify(workDir)} clean -fd`)
+        shellExec(`git -C ${JSON.stringify(workDir)} reset --hard HEAD~1 2>/dev/null || git -C ${JSON.stringify(workDir)} checkout . && git -C ${JSON.stringify(workDir)} clean -fd`)
       } catch {
-        // Continue anyway
+        try {
+          shellExec(`git -C ${JSON.stringify(workDir)} checkout .`)
+          shellExec(`git -C ${JSON.stringify(workDir)} clean -fd`)
+        } catch {
+          // Continue anyway
+        }
       }
     }
 
@@ -717,6 +1034,7 @@ async function main() {
   console.log(`  Max turns: ${MAX_TURNS}`)
   console.log(`  Review loops: ${REVIEW_LOOPS}`)
   console.log(`  Context budget: ${CONTEXT_BUDGET} chars`)
+  console.log(`  Blind mode: ${BLIND_MODE ? "ON (no diff, model must find the bug)" : "OFF"}`)
   if (ITERATE_UNTIL_IMPROVEMENT) {
     console.log(`  Performance mode: iterate up to ${MAX_ITERATIONS}x`)
   }
@@ -724,6 +1042,7 @@ async function main() {
   const pipelineResult: PipelineResult = {
     pr: { owner, repo, number, title: "" },
     workDir: "",
+    blindMode: BLIND_MODE,
     phases: {
       intake: { ok: false },
       workspace: { ok: false },
@@ -827,6 +1146,7 @@ async function main() {
 
   // ── Phase 5: Specialist Review + Refinement Loop ──
   console.log("\n--- Phase 5: Specialist Review ---")
+  const initialDiff = execDiff  // Keep the first execution diff for comparison
   let currentDiff = execDiff
   let allFeedback: SpecialistFeedback[] = []
 
@@ -844,13 +1164,20 @@ async function main() {
     }
 
     if (loop < REVIEW_LOOPS - 1) {
-      // Refine: reset and re-execute with feedback
+      // Refine: reset workspace to pre-execution baseline and re-execute with feedback
       console.log(`  [review] Refining with specialist feedback...`)
       try {
-        shellExec(`git -C ${JSON.stringify(workDir)} checkout .`)
-        shellExec(`git -C ${JSON.stringify(workDir)} clean -fd`)
+        // Reset to the baseline commit (before any pipeline execution commits)
+        // The branch was created from the base ref, so HEAD~N may be the execution commit
+        shellExec(`git -C ${JSON.stringify(workDir)} reset --hard HEAD~1 2>/dev/null || git -C ${JSON.stringify(workDir)} checkout . && git -C ${JSON.stringify(workDir)} clean -fd`)
       } catch {
-        // Continue
+        // Fallback to simple checkout
+        try {
+          shellExec(`git -C ${JSON.stringify(workDir)} checkout .`)
+          shellExec(`git -C ${JSON.stringify(workDir)} clean -fd`)
+        } catch {
+          // Continue anyway
+        }
       }
 
       try {
@@ -867,11 +1194,34 @@ async function main() {
 
   // ── Phase 6: Comparison ──
   console.log("\n--- Phase 6: Comparison ---")
-  if (intake.diff && currentDiff) {
-    printComparison(intake.diff, currentDiff)
+  // Use the initial execution diff for comparison (has the actual code fix),
+  // not the refinement diff which may be polluted by npm install artifacts
+  const bestDiffForComparison = initialDiff || currentDiff
+  if (intake.diff && bestDiffForComparison) {
+    const cmpResult = printComparison(intake.diff, bestDiffForComparison)
     pipelineResult.phases.comparison = {
       originalDiff: intake.diff.slice(0, 5000),
-      newDiff: currentDiff.slice(0, 5000),
+      newDiff: bestDiffForComparison.slice(0, 5000),
+      sameFiles: cmpResult.sameFiles,
+      sameFix: cmpResult.sameFix,
+    }
+
+    // In blind mode, run post-hoc LLM comparison
+    if (BLIND_MODE && bestDiffForComparison.length > 10) {
+      try {
+        const blindResult = await runBlindComparisonReview(
+          intake.diff,
+          bestDiffForComparison,
+          task,
+          allFeedback,
+          intake.reviewComments,
+        )
+        pipelineResult.phases.comparison.reviewerFeedbackCaught = blindResult.reviewerFeedbackCaught
+        console.log(`\n--- Blind Comparison Analysis ---`)
+        console.log(blindResult.analysis)
+      } catch (err: any) {
+        console.log(`  [blind-compare] Failed: ${err.message?.slice(0, 100)}`)
+      }
     }
   } else {
     console.log("  [comparison] Cannot compare -- missing diff(s)")
