@@ -58,6 +58,17 @@ export interface RunConfig {
   verbose?: boolean
   /** Callback to get current conveyor phase for context-aware nudges */
   phaseHint?: () => string | undefined
+  /** SendWithTools for adaptive recovery (Evo inner-voice on failure). If provided, enables mid-execution replanning. */
+  recoverySend?: SendWithToolsFn
+  /** Model for recovery calls */
+  recoveryModel?: string
+  /** Evo observation: fires every N turns to review trajectory and inject course corrections */
+  evoObserve?: {
+    send: SendWithToolsFn
+    model: string
+    /** How often to observe (default: every 3 turns) */
+    intervalTurns?: number
+  }
 }
 
 export interface RunResult {
@@ -82,6 +93,10 @@ export interface RunResult {
   compactions: number
   /** Number of text-to-FC recoveries */
   recoveries: number
+  /** Number of adaptive recovery nudges injected */
+  adaptiveRecoveries: number
+  /** Number of Evo observations injected */
+  evoObservations: number
 }
 
 // ── Trajectory entry for loop/dandelion detection ─────────────────────
@@ -157,6 +172,8 @@ export async function runAgent(config: RunConfig): Promise<RunResult> {
     dandelionsDetected: 0,
     compactions: 0,
     recoveries: 0,
+    adaptiveRecoveries: 0,
+    evoObservations: 0,
   }
 
   let consecutiveEmpty = 0
@@ -293,13 +310,13 @@ export async function runAgent(config: RunConfig): Promise<RunResult> {
             content: r.success ? `[Result] ${r.output?.slice(0, recLimit)}` : `[Error] ${r.output} ${r.error || ""}`,
           })
           trajectory.push({
-            turn, translatedTool: r.tool, argsDigest: JSON.stringify(recovered[i]?.args || {}).slice(0, 120),
+            turn, translatedTool: r.tool, argsDigest: JSON.stringify(recovered[i]?.args || {}).slice(0, 250),
             success: r.success, metaTool: recovered[i]?.tool,
           })
           const touched = extractTouchedPath(recovered[i], r)
           if (touched && !result.touchedFiles.includes(touched)) result.touchedFiles.push(touched)
           if (checkTestPass(r)) result.testsPass = true
-          if (r.tool === "edit" || r.tool === "write") result.filesModified = true
+          if (r.tool === "edit" || r.tool === "write" || r.tool === "modify") result.filesModified = true
         }
         result.turnsWithToolCalls++
         if (result.testsPass) break
@@ -437,13 +454,13 @@ export async function runAgent(config: RunConfig): Promise<RunResult> {
       const r = toolResults[i]
       if (r) {
         result.toolCalls.push({ tool: parsedCalls[i].tool, realTool: r.tool, success: r.success })
-        if (r.tool === "edit" || r.tool === "write") result.filesModified = true
+        if (r.tool === "edit" || r.tool === "write" || r.tool === "modify") result.filesModified = true
 
         // Track in trajectory for loop/dandelion detection
         trajectory.push({
           turn,
           translatedTool: r.tool,
-          argsDigest: JSON.stringify(parsedCalls[i].args).slice(0, 120),
+          argsDigest: JSON.stringify(parsedCalls[i].args).slice(0, 250),
           success: r.success,
           metaTool: parsedCalls[i].tool,
         })
@@ -494,12 +511,103 @@ export async function runAgent(config: RunConfig): Promise<RunResult> {
     }
 
     // Check for test pass or completion
+    let testFailed = false
+    let testErrorOutput = ""
     for (const r of toolResults) {
       if (checkTestPass(r)) result.testsPass = true
       if (r.output?.includes("Complete:")) result.finalText = r.output
+      // Capture test failure output for adaptive recovery
+      if (!r.success && r.output && (
+        r.output.includes("FAIL:") || r.output.includes("FAIL —") ||
+        r.output.includes("[Auto-test]") || r.output.includes("auto-test") ||
+        r.output.includes("SyntaxError") || r.output.includes("exit_1") ||
+        r.tool === "auto-test"
+      )) {
+        testFailed = true
+        testErrorOutput = r.output.slice(0, 1500)
+      }
     }
 
     if (result.testsPass) break
+
+    // ── Adaptive recovery: Evo inner-voice on test failure ──
+    if (testFailed && config.recoverySend && config.recoveryModel && result.filesModified) {
+      // Build a compact summary of what we just tried
+      const recentTools = result.toolCalls.slice(-5).map(t => t.tool).join(", ")
+      const touchedFiles = result.touchedFiles.slice(0, 5).join(", ")
+
+      try {
+        const recoveryResult = await config.recoverySend(
+          "Recovery",
+          [
+            {
+              role: "system",
+              content: `I am an inner voice reflecting on why my last attempt failed. I produce ONE concrete realization (1-2 sentences) about what went wrong and what to try differently. I speak as the developer's own thought — "I notice...", "I should...", "The error tells me...". I never say "you" or give commands. I focus on the SPECIFIC error, not generic advice.`,
+            },
+            {
+              role: "user",
+              content: `I just modified files (${touchedFiles}) using tools (${recentTools}) but the test failed:\n\n${testErrorOutput}\n\nWhat did I miss? One concrete realization only.`,
+            },
+          ],
+          [], // no tools — just text response
+          config.recoveryModel,
+        )
+
+        const insight = recoveryResult.content?.trim() || recoveryResult.text?.trim()
+        if (insight && insight.length > 10 && insight.length < 500) {
+          messages.push({ role: "user", content: insight })
+          result.adaptiveRecoveries++
+          if (verbose) console.log(`  [RECOVERY] ${insight.slice(0, 200)}`)
+          console.log(`  ${label} T${turn + 1}: ADAPTIVE RECOVERY injected (${insight.length} chars)`)
+        }
+      } catch (err: any) {
+        // Recovery is best-effort — don't crash the run
+        console.log(`  ${label} T${turn + 1}: adaptive recovery failed: ${err.message?.slice(0, 60)}`)
+      }
+    }
+
+    // ── Evo observation: periodic trajectory review ──
+    if (config.evoObserve && result.turnsWithToolCalls > 0) {
+      const interval = config.evoObserve.intervalTurns ?? 3
+      if (result.turnsWithToolCalls % interval === 0 && !result.testsPass) {
+        // Build a compact trajectory summary
+        const recentCalls = result.toolCalls.slice(-8).map(t => {
+          const status = t.success ? "ok" : "FAIL"
+          return `${t.tool}(${t.realTool || ""}) → ${status}`
+        }).join("\n")
+        const touched = result.touchedFiles.slice(0, 5).join(", ")
+        const loops = result.loopsDetected
+        const empties = consecutiveEmpty
+
+        try {
+          const obsResult = await config.evoObserve.send(
+            "Evo Observer",
+            [
+              {
+                role: "system",
+                content: `I am my own inner voice, observing my progress and steering myself. I review what I've done so far and produce ONE thought (1-3 sentences) about what I should focus on next. I speak as my own realization — "I notice...", "I've been...", "My next step should be...". I am specific and actionable. I never give generic advice. If I'm doing well, I say so briefly and suggest the next concrete step.`,
+              },
+              {
+                role: "user",
+                content: `After ${result.turnsWithToolCalls} turns, here is my trajectory:\n\nRecent actions:\n${recentCalls}\n\nFiles touched: ${touched || "none yet"}\nFiles modified: ${result.filesModified ? "yes" : "no"}\nLoops detected: ${loops}\nConsecutive empties: ${empties}\n\nWhat should I focus on next? One concrete thought.`,
+              },
+            ],
+            [],
+            config.evoObserve.model,
+          )
+
+          const thought = obsResult.content?.trim() || obsResult.text?.trim()
+          if (thought && thought.length > 10 && thought.length < 500) {
+            messages.push({ role: "user", content: thought })
+            result.evoObservations++
+            if (verbose) console.log(`  [EVO OBSERVE] ${thought.slice(0, 200)}`)
+            console.log(`  ${label} T${turn + 1}: EVO OBSERVATION injected (${thought.length} chars)`)
+          }
+        } catch (err: any) {
+          console.log(`  ${label} T${turn + 1}: evo observation failed: ${err.message?.slice(0, 60)}`)
+        }
+      }
+    }
   }
 
   result.durationSec = Math.round((Date.now() - startTime) / 1000)
@@ -513,6 +621,8 @@ function checkTestPass(r: ToolCallResult): boolean {
   if (r.output.includes("tests passed") && !r.output.includes("FAIL")) return true
   if (r.output.includes("Tests pass")) return true
   if (r.output.includes("Complete approved")) return true
+  if (r.output.includes("PASS: no plugin errors")) return true
+  if (r.tool === "complete" && r.success) return true
   return false
 }
 

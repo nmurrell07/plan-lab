@@ -171,7 +171,7 @@ export function detectLoop(
   if (trajectory.length < 3) return null
 
   const recent = trajectory.slice(-window)
-  const sigs = recent.map(t => `${t.translatedTool}:${t.argsDigest.slice(0, 40)}`)
+  const sigs = recent.map(t => `${t.translatedTool}:${t.argsDigest}`)
 
   // Count signature frequencies
   const counts = new Map<string, number>()

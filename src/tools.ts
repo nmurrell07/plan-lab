@@ -8,9 +8,10 @@
 import fs from "fs/promises"
 import { existsSync, readFileSync } from "fs"
 import path from "path"
-import { validateSyntax } from "./conveyor"
+import { validateSyntax, runSurgicalEditConveyor } from "./conveyor"
+import type { SurgicalEditSeed } from "./conveyor"
 import { spawn } from "child_process"
-import type { OpenAIToolDef } from "./client"
+import type { OpenAIToolDef, SendWithToolsFn, ChatMessage } from "./client"
 
 // ── Types ─────────────────────────────────────────────────────────────
 
@@ -246,10 +247,7 @@ async function toolBash(args: Record<string, string>, ctx: ExecutionContext): Pr
 
   const result = await runShell(command, ctx.workDir)
   const output = (result.stdout + (result.stderr ? `\nSTDERR: ${result.stderr}` : "")).trim()
-
-  // False success detection: exit 0 but stderr has error indicators
-  const hasErrorSignals = /error|exception|FAIL|fatal|panic|traceback/i.test(result.stderr)
-  const success = result.code === 0 && !hasErrorSignals
+  const success = result.code === 0
 
   return { tool: "bash", success, output: output.slice(0, 4000), error: success ? undefined : `Exit ${result.code}` }
 }
@@ -283,6 +281,80 @@ export function createToolExecutor(): ToolExecutor {
           default:
             results.push({ tool: call.tool, success: false, output: "", error: `Unknown tool: ${call.tool}` })
         }
+      }
+
+      return results
+    },
+  }
+}
+
+// ── Enhanced executor with surgical conveyor ─────────────────────────
+
+export interface EnhancedExecutorConfig {
+  /** SendWithTools for surgical conveyor stations */
+  sendWithTools: SendWithToolsFn
+  /** Model for conveyor station calls */
+  model: string
+  /** Max retries per conveyor station (default: 2) */
+  maxRetries?: number
+}
+
+/**
+ * Creates a tool executor that routes edit calls through the surgical conveyor
+ * when possible, falling back to direct edit on failure.
+ */
+export function createEnhancedToolExecutor(config: EnhancedExecutorConfig): ToolExecutor {
+  const baseExecutor = createToolExecutor()
+
+  return {
+    async executeAll(calls, context) {
+      const results: ToolCallResult[] = []
+
+      for (const call of calls) {
+        // Route edits through surgical conveyor
+        if (call.tool === "edit") {
+          const file = call.args.path || call.args.file || ""
+          const oldText = call.args.old_string || call.args.old_text || ""
+          const newText = call.args.new_string || call.args.new_text || call.args.content || ""
+          const searchHint = oldText.split("\n")[0]?.trim().slice(0, 60) || ""
+
+          if (file && searchHint) {
+            const surgicalMessages: ChatMessage[] = [
+              { role: "system", content: "I am editing code. I answer each station question precisely." },
+              { role: "user", content: `Edit ${file}: find "${searchHint}" and replace the matching section.` },
+            ]
+
+            try {
+              const surgicalResult = await runSurgicalEditConveyor(
+                surgicalMessages,
+                config.sendWithTools,
+                config.model,
+                context.workDir,
+                config.maxRetries ?? 2,
+                { file, searchKeyword: searchHint, newText: newText || undefined },
+              )
+
+              if (surgicalResult.success) {
+                console.log(`    [surgical] SUCCESS: ${surgicalResult.output}`)
+                results.push(surgicalResult)
+                continue
+              }
+
+              console.log(`    [surgical] FAIL: ${surgicalResult.error} — falling back to direct edit`)
+            } catch (err: any) {
+              console.log(`    [surgical] ERROR: ${err.message?.slice(0, 60)} — falling back to direct edit`)
+            }
+          }
+
+          // Fallback to direct edit
+          const [directResult] = await baseExecutor.executeAll([call], context)
+          results.push(directResult)
+          continue
+        }
+
+        // All other tools go through the base executor
+        const [result] = await baseExecutor.executeAll([call], context)
+        results.push(result)
       }
 
       return results

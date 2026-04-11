@@ -219,6 +219,7 @@ interface ExperimentResult {
   conveyorGateBlocks?: number
   conveyorVerifyAttempts?: number
   conveyorLoopBacks?: number
+  adaptiveRecoveries?: number
   error?: string
   interceptorFirings: number
   loopsDetected: number
@@ -374,6 +375,9 @@ Use checkoff to keep your work aligned with the checklist.`
         runId: `${scenario.id}-${modelEntry.label}-${planMode}-${toolMode}`,
         verbose: VERBOSE,
         phaseHint: meta.state.conveyor ? () => meta.state.conveyor?.phase : undefined,
+        recoverySend: (planMode === "scaffold_plan" || planMode === "conveyor_planner") ? send : undefined,
+        recoveryModel: (planMode === "scaffold_plan" || planMode === "conveyor_planner") ? modelEntry.model : undefined,
+        evoObserve: (planMode === "scaffold_plan" || planMode === "conveyor_planner") ? { send, model: modelEntry.model, intervalTurns: 3 } : undefined,
       })
 
       result.testsPass = runResult.testsPass
@@ -388,6 +392,7 @@ Use checkoff to keep your work aligned with the checklist.`
       result.dandelionsDetected = runResult.dandelionsDetected
       result.compactions = runResult.compactions
       result.recoveries = runResult.recoveries
+      result.adaptiveRecoveries = runResult.adaptiveRecoveries || undefined
       result.checklistTotalSteps = meta.state.checklistSteps.length || undefined
       result.checkoffCalls = meta.state.checkoffCalls || undefined
       result.checklistCompletedSteps = meta.state.completedSteps || undefined

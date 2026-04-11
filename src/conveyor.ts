@@ -407,9 +407,68 @@ export function recoverToolCallsFromText(
 ): Array<{ tool: string; args: Record<string, string>; raw: string }> | null {
   const calls: Array<{ tool: string; args: Record<string, string>; raw: string }> = []
 
-  // ── Tier 1: Channel markers ──
-  const channelPattern = /<\|tool_call_begin\|>functions\.(\w+)(?::\d+)?<\|tool_call_argument_begin\|>([\s\S]*?)<\|tool_call_argument_end\|>/g
+  // ── Tier 0: Kimi Linear markers ──
+  // Kimi uses <|tool_calls_section_begin|> with a different structure than standard channel markers
+  const kimiSectionPattern = /<\|tool_calls_section_begin\|>([\s\S]*?)<\|tool_calls_section_end\|>/g
   let match
+  while ((match = kimiSectionPattern.exec(text)) !== null) {
+    const section = match[1]
+    // Kimi wraps individual calls within the section
+    const kimiCallPattern = /<\|tool_call_begin\|>([\s\S]*?)<\|tool_call_end\|>/g
+    let callMatch
+    while ((callMatch = kimiCallPattern.exec(section)) !== null) {
+      const callBody = callMatch[1]
+      // Extract function name and arguments
+      const nameMatch = callBody.match(/(\w+)\s*\n/)
+      const argsMatch = callBody.match(/```json\s*\n?([\s\S]*?)```/) || callBody.match(/(\{[\s\S]*\})/)
+      if (nameMatch && argsMatch) {
+        const toolName = nameMatch[1].trim()
+        try {
+          const args = JSON.parse(argsMatch[1].trim())
+          if (availableTools.includes(toolName)) {
+            calls.push({ tool: toolName, args, raw: callMatch[0] })
+          }
+        } catch { /* skip malformed */ }
+      }
+    }
+  }
+  if (calls.length > 0) return calls
+
+  // Lenient Kimi: section begin without section end (truncated)
+  const kimiLenientPattern = /<\|tool_calls_section_begin\|>([\s\S]*?)(?:<\|tool_calls_section_end\|>|$)/g
+  while ((match = kimiLenientPattern.exec(text)) !== null) {
+    const section = match[1]
+    // Try to find function name + JSON args
+    const fnPattern = /(\w+)\s*\n\s*```(?:json)?\s*\n?([\s\S]*?)```/g
+    let fnMatch
+    while ((fnMatch = fnPattern.exec(section)) !== null) {
+      const toolName = fnMatch[1].trim()
+      try {
+        const args = JSON.parse(fnMatch[2].trim())
+        if (availableTools.includes(toolName)) {
+          calls.push({ tool: toolName, args, raw: fnMatch[0] })
+        }
+      } catch { /* skip */ }
+    }
+    // Also try without code fences — just name + bare JSON
+    if (calls.length === 0) {
+      const barePattern = /(\w+)\s*\n\s*(\{[\s\S]*?\})\s*(?:\n|$)/g
+      let bareMatch
+      while ((bareMatch = barePattern.exec(section)) !== null) {
+        const toolName = bareMatch[1].trim()
+        try {
+          const args = JSON.parse(bareMatch[2].trim())
+          if (availableTools.includes(toolName)) {
+            calls.push({ tool: toolName, args, raw: bareMatch[0] })
+          }
+        } catch { /* skip */ }
+      }
+    }
+  }
+  if (calls.length > 0) return calls
+
+  // ── Tier 1: Channel markers (Qwen-style) ──
+  const channelPattern = /<\|tool_call_begin\|>functions\.(\w+)(?::\d+)?<\|tool_call_argument_begin\|>([\s\S]*?)<\|tool_call_argument_end\|>/g
   while ((match = channelPattern.exec(text)) !== null) {
     const toolName = match[1]
     try {
