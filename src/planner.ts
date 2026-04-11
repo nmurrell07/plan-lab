@@ -612,6 +612,9 @@ async function runExploreChecklistExplorer(config: PlanningConfig): Promise<{ fi
     maxTurns: config.explorerMaxTurns ?? 6,
     allowedTools: ["read", "grep", "list", "glob", "complete"],
     logLabel: "explore-checklist",
+    evoObserve: { send: explorerSend, model: workerModel, intervalTurns: 2 },
+    recoverySend: explorerSend,
+    recoveryModel: workerModel,
   })
 
   return {
@@ -697,6 +700,9 @@ export async function generateWorkerPlan(config: PlanningConfig): Promise<PlanAr
     maxTurns: config.explorerMaxTurns ?? 15,
     allowedTools: ["read", "grep", "list", "glob", "bash", "complete"],
     logLabel: "plan-explorer",
+    evoObserve: { send: explorerSend, model: workerModel, intervalTurns: 2 },
+    recoverySend: explorerSend,
+    recoveryModel: workerModel,
   })
 
   tokenCost += explorerResult.totalTokens
@@ -823,6 +829,9 @@ export async function generateMultiExplorePlan(config: PlanningConfig): Promise<
       maxTurns: config.explorerMaxTurns ?? 12,
       allowedTools: ["read", "grep", "list", "glob", "bash", "complete"],
       logLabel: `explorer-${spec.name.toLowerCase().replace(/\s+/g, "-")}`,
+      evoObserve: { send: explorerSend, model: workerModel, intervalTurns: 2 },
+      recoverySend: explorerSend,
+      recoveryModel: workerModel,
     })
   })
 
@@ -1038,6 +1047,11 @@ export async function generateScaffoldPlan(config: PlanningConfig): Promise<Plan
     allowedTools: ["read", "grep", "list", "glob", "complete"],
     logLabel: "scaffold-explorer",
     verbose: !!process.env.VERBOSE && process.env.VERBOSE === "1",
+    // Evo observation steers the explorer — critical for models that drift (20B text-only, modify attempts)
+    evoObserve: { send: explorerSend, model: workerModel, intervalTurns: 2 },
+    // Adaptive recovery on tool failures
+    recoverySend: explorerSend,
+    recoveryModel: workerModel,
   })
 
   tokenCost += explorerResult.totalTokens
