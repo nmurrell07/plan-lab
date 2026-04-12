@@ -1,0 +1,19 @@
+{
+  "test": "coderpg-plugin-creation",
+  "timestamp": "2026-04-12T04:35:55.783Z",
+  "maxTurns": 30,
+  "workerTurns": 50,
+  "results": [
+    {
+      "combo": "27B-orch/9B-worker",
+      "orchModel": "qwen3.5-27b",
+      "workerModel": "qwen/qwen3.5-9b",
+      "pass": true,
+      "orchTurns": 7,
+      "orchTokens": 16770,
+      "workerRuns": 1,
+      "totalDurationSec": 1022,
+      "specialistReviews": 0
+    }
+  ]
+}
