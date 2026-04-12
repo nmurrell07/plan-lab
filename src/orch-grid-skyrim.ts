@@ -54,9 +54,10 @@ interface ModelDef {
 }
 
 const MODELS: Record<string, ModelDef> = {
-  "9B":  { label: "9B",  model: "qwen/qwen3.5-9b",      endpoint: ENDPOINT_A },
-  "27B": { label: "27B", model: "qwen3.5-27b",             endpoint: ENDPOINT_A },
-  "35B": { label: "35B", model: "qwen/qwen3.5-35b-a3b",  endpoint: ENDPOINT_B },
+  "9B":   { label: "9B",   model: "qwen/qwen3.5-9b",       endpoint: ENDPOINT_A },
+  "27B":  { label: "27B",  model: "qwen3.5-27b",            endpoint: ENDPOINT_A },
+  "35B":  { label: "35B",  model: "qwen/qwen3.5-35b-a3b",  endpoint: ENDPOINT_B },
+  "397B": { label: "397B", model: "qwen3.5-397b-a17b",      endpoint: ENDPOINT_B },
 }
 
 interface GridCombo {
@@ -72,6 +73,12 @@ const GRID: GridCombo[] = [
   { name: "35B-orch/9B-worker",  orch: MODELS["35B"], worker: MODELS["9B"] },
   { name: "35B-orch/27B-worker", orch: MODELS["35B"], worker: MODELS["27B"] },
   { name: "35B-orch/35B-worker", orch: MODELS["35B"], worker: MODELS["35B"] },
+  { name: "9B-orch/9B-worker",    orch: MODELS["9B"],   worker: MODELS["9B"] },
+  { name: "9B-orch/27B-worker",   orch: MODELS["9B"],   worker: MODELS["27B"] },
+  { name: "9B-orch/35B-worker",   orch: MODELS["9B"],   worker: MODELS["35B"] },
+  { name: "397B-orch/9B-worker",  orch: MODELS["397B"], worker: MODELS["9B"] },
+  { name: "397B-orch/27B-worker", orch: MODELS["397B"], worker: MODELS["27B"] },
+  { name: "397B-orch/35B-worker", orch: MODELS["397B"], worker: MODELS["35B"] },
 ]
 
 // ── Skyrim Mod Structure Scaffold ───────────────────────────────────────
