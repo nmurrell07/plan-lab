@@ -1,0 +1,19 @@
+{
+  "test": "skyrim-mod-registration",
+  "timestamp": "2026-04-12T09:16:08.083Z",
+  "maxTurns": 30,
+  "workerTurns": 50,
+  "results": [
+    {
+      "combo": "27B-orch/35B-worker",
+      "orchModel": "qwen3.5-27b",
+      "workerModel": "qwen/qwen3.5-35b-a3b",
+      "pass": true,
+      "orchTurns": 7,
+      "orchTokens": 17548,
+      "workerRuns": 1,
+      "totalDurationSec": 625,
+      "specialistReviews": 0
+    }
+  ]
+}
